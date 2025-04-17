@@ -7,24 +7,71 @@ import (
 	"log"
 )
 
-// Transaction represents a basic transaction structure.
-// In a real system, this would be more complex (inputs, outputs, signatures).
+// TransactionType distinguishes different kinds of transactions.
+type TransactionType uint8
+
+const (
+	// IntraShardTx occurs within a single shard.
+	IntraShardTx TransactionType = iota
+	// CrossShardTxInit initiates a transaction spanning multiple shards.
+	CrossShardTxInit
+	// CrossShardTxFinalize finalizes a transaction based on a receipt from another shard.
+	CrossShardTxFinalize
+)
+
+// Transaction represents a transaction structure.
 type Transaction struct {
 	ID   []byte
-	Data []byte // Simple data payload for now
+	Type TransactionType
+	Data []byte // Payload specific to the transaction type
+
+	// Optional fields for cross-shard transfers:
+	SourceShard      *ShardID // Pointer allows nil for non-cross-shard or unknown source
+	DestinationShard *ShardID // Pointer allows nil for non-cross-shard
 }
 
-// NewTransaction creates a basic transaction.
-// The ID is simply the hash of the data for this basic example.
+// NewTransaction creates a basic intra-shard transaction.
 func NewTransaction(data []byte) *Transaction {
-	tx := &Transaction{Data: data}
+	tx := &Transaction{
+		Type: IntraShardTx,
+		Data: data,
+	}
+	tx.ID = tx.Hash() // Use Hash() method which considers Type now
+	return tx
+}
+
+// NewCrossShardInitTransaction creates the initiating part of a cross-shard transaction.
+func NewCrossShardInitTransaction(data []byte, source ShardID, dest ShardID) *Transaction {
+	tx := &Transaction{
+		Type:             CrossShardTxInit,
+		Data:             data,
+		SourceShard:      &source,
+		DestinationShard: &dest,
+	}
 	tx.ID = tx.Hash()
 	return tx
 }
 
-// Hash calculates the SHA256 hash of the transaction data.
+// Hash calculates the SHA256 hash of the transaction (including type).
 func (tx *Transaction) Hash() []byte {
-	hash := sha256.Sum256(tx.Data)
+	var encoded bytes.Buffer
+	enc := gob.NewEncoder(&encoded)
+	// Encode relevant fields for hashing
+	err := enc.Encode(struct {
+		Type TransactionType
+		Data []byte
+		Src  *ShardID
+		Dst  *ShardID
+	}{
+		Type: tx.Type,
+		Data: tx.Data,
+		Src:  tx.SourceShard,
+		Dst:  tx.DestinationShard,
+	})
+	if err != nil {
+		log.Panicf("Failed to encode transaction for hashing: %v", err)
+	}
+	hash := sha256.Sum256(encoded.Bytes())
 	return hash[:]
 }
 
