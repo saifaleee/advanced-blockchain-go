@@ -107,9 +107,7 @@ func TestAddTransactionAndMineShardBlock(t *testing.T) {
 		if err != nil {
 			// It's possible a shard got no txs if DetermineShard mapped them all elsewhere
 			shard, _ := bc.ShardManager.GetShard(shardID)
-			shard.TxPoolMu.RLock()
-			poolSize := len(shard.TxPool)
-			shard.TxPoolMu.RUnlock()
+			poolSize := shard.GetTxPoolSize()
 			if poolSize == 0 {
 				t.Logf("Shard %d had no transactions, mining skipped or resulted in empty block (expected). Err: %v", shardID, err)
 				// If empty blocks are allowed, MineShardBlock shouldn't error here unless PoW fails
@@ -303,7 +301,7 @@ func TestCrossShardTransaction(t *testing.T) {
 		// Our current AddTransaction routes based on SourceShard field if present.
 		// Verify tx is in source shard pool:
 		shard, _ := bc.ShardManager.GetShard(sourceShard)
-		shard.TxPoolMu.RLock()
+		shard.Mu.RLock()
 		found := false
 		for _, ptx := range shard.TxPool {
 			if bytes.Equal(ptx.ID, initTx.ID) {
@@ -311,7 +309,7 @@ func TestCrossShardTransaction(t *testing.T) {
 				break
 			}
 		}
-		shard.TxPoolMu.RUnlock()
+		shard.Mu.RUnlock()
 		if !found {
 			t.Errorf("Cross-shard init tx %x not found in source shard %d pool", initTx.ID, sourceShard)
 		}

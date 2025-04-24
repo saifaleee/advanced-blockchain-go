@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"advanced-blockchain-go/v1/core"
+	"github.com/saifaleee/advanced-blockchain-go/core"
 	// Import bloom for testing filter
 )
 

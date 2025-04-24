@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"advanced-blockchain-go/v1/core"
+	"github.com/saifaleee/advanced-blockchain-go/core"
 )
 
 func TestNewShardManager(t *testing.T) {
@@ -94,28 +94,28 @@ func TestRouteTransaction(t *testing.T) {
 	// Check if transactions landed in the correct shard's pool
 	shard1, _ := sm.GetShard(expectedShardID1)
 	found1 := false
-	shard1.TxPoolMu.RLock() // Assume TxPool has a RWMutex (add this to Shard struct if needed)
+	shard1.Mu.RLock() // Use the exported Mu field
 	for _, tx := range shard1.TxPool {
 		if bytes.Equal(tx.ID, tx1.ID) {
 			found1 = true
 			break
 		}
 	}
-	shard1.TxPoolMu.RUnlock()
+	shard1.Mu.RUnlock()
 	if !found1 {
 		t.Errorf("Tx1 not found in expected shard %d pool", expectedShardID1)
 	}
 
 	shard2, _ := sm.GetShard(expectedShardID2)
 	found2 := false
-	shard2.TxPoolMu.RLock() // Assume TxPool has a RWMutex
+	shard2.Mu.RLock() // Use the exported Mu field
 	for _, tx := range shard2.TxPool {
 		if bytes.Equal(tx.ID, tx2.ID) {
 			found2 = true
 			break
 		}
 	}
-	shard2.TxPoolMu.RUnlock()
+	shard2.Mu.RUnlock()
 	if !found2 {
 		t.Errorf("Tx2 not found in expected shard %d pool", expectedShardID2)
 	}
@@ -123,14 +123,14 @@ func TestRouteTransaction(t *testing.T) {
 	// If shards are different, check tx1 is NOT in shard2's pool
 	if expectedShardID1 != expectedShardID2 {
 		found1in2 := false
-		shard2.TxPoolMu.RLock()
+		shard2.Mu.RLock()
 		for _, tx := range shard2.TxPool {
 			if bytes.Equal(tx.ID, tx1.ID) {
 				found1in2 = true
 				break
 			}
 		}
-		shard2.TxPoolMu.RUnlock()
+		shard2.Mu.RUnlock()
 		if found1in2 {
 			t.Errorf("Tx1 was found in unexpected shard %d pool", expectedShardID2)
 		}

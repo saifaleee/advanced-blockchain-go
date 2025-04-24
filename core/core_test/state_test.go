@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"advanced-blockchain-go/v1/core"
+	"github.com/saifaleee/advanced-blockchain-go/core"
 )
 
 func TestInMemoryStateDB_PutGet(t *testing.T) {

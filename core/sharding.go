@@ -18,7 +18,7 @@ type Shard struct {
 	State     StateDB        // State specific to this shard
 	BlockChan chan *Block    // Channel to receive blocks for this shard
 	TxPool    []*Transaction // Simple transaction pool for the shard
-	mu        sync.RWMutex
+	Mu        sync.RWMutex   // Exported mutex for transaction pool access
 	// Add metrics like transaction count, state size for dynamic splitting/merging decisions
 }
 
@@ -34,8 +34,8 @@ func NewShard(id ShardID) *Shard {
 
 // AddTransaction adds a transaction to the shard's pool (basic implementation).
 func (s *Shard) AddTransaction(tx *Transaction) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 	s.TxPool = append(s.TxPool, tx)
 	// In a real system, validate tx against shard state here
 	log.Printf("Shard %d: Added Tx %x to pool", s.ID, tx.ID)
@@ -43,8 +43,8 @@ func (s *Shard) AddTransaction(tx *Transaction) {
 
 // GetTransactionsForBlock retrieves transactions to be included in the next block for this shard.
 func (s *Shard) GetTransactionsForBlock(maxTx int) []*Transaction {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 
 	count := len(s.TxPool)
 	if count == 0 {
@@ -59,6 +59,13 @@ func (s *Shard) GetTransactionsForBlock(maxTx int) []*Transaction {
 	s.TxPool = s.TxPool[count:] // Remove retrieved transactions
 
 	return txs
+}
+
+// GetTxPoolSize safely returns the current size of the transaction pool
+func (s *Shard) GetTxPoolSize() int {
+	s.Mu.RLock()
+	defer s.Mu.RUnlock()
+	return len(s.TxPool)
 }
 
 // ShardManager manages the different shards in the blockchain.
@@ -196,8 +203,8 @@ type CrossShardReceipt struct {
 // ProcessCrossShardReceipt processes a receipt received from another shard.
 // Placeholder: This logic would be integrated into block processing.
 func (s *Shard) ProcessCrossShardReceipt(receipt *CrossShardReceipt) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
 
 	if receipt.DestinationShard != s.ID {
 		return errors.New("receipt destined for wrong shard")
