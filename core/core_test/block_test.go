@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/saifaleee/advanced-blockchain-go/core"
-	// Import bloom for testing filter
+	//"github.com/willf/bloom" // Import bloom for testing filter
 )
 
 // Helper to create sample transactions (unchanged)
@@ -21,7 +21,7 @@ func createSampleTransactions(count int) []*core.Transaction {
 }
 
 func TestNewBlockSharded(t *testing.T) { // Renamed for clarity
-	shardID := core.ShardID(1)
+	shardID := uint64(1)
 	prevHash := []byte("previousblockhashshard1")
 	height := 1
 	difficulty := 5
@@ -82,7 +82,7 @@ func TestNewBlockSharded(t *testing.T) { // Renamed for clarity
 
 // TestProofOfWork needs minimal change if prepareData is updated correctly
 func TestProofOfWorkSharded(t *testing.T) { // Renamed
-	shardID := core.ShardID(0)
+	shardID := uint64(0)
 	difficulty := 8
 	block := &core.Block{
 		ShardID:       shardID,
@@ -124,7 +124,7 @@ func TestProofOfWorkSharded(t *testing.T) { // Renamed
 }
 
 func TestBlockSerializationSharded(t *testing.T) { // Renamed
-	shardID := core.ShardID(2)
+	shardID := uint64(2)
 	prevHash := []byte("prevhashshard2")
 	txs := createSampleTransactions(1)
 	block := core.NewBlock(shardID, txs, prevHash, 1, 4)

@@ -2,17 +2,26 @@ package core
 
 import (
 	"errors"
+	"fmt"
 	"sync"
-	"unsafe" // For approximate size calculation
 )
 
 // StateDB defines the interface for accessing blockchain state.
+// In a sharded system, each shard would typically have its own StateDB instance.
 type StateDB interface {
 	Get(key []byte) ([]byte, error)
 	Put(key, value []byte) error
 	Delete(key []byte) error
-	Size() int64 // Added method to get approximate size
-	// In a real DB, you'd have methods for iteration, batching, snapshots, etc.
+	// GetKeys returns all keys in the state DB. Used for migration.
+	// In a real DB (e.g., BadgerDB, LevelDB), this would use iterators.
+	GetKeys() ([][]byte, error)
+	// GetStateRoot calculates a root hash representing the state.
+	// Placeholder for SMT/Patricia Trie integration.
+	GetStateRoot() ([]byte, error)
+	// Size returns the approximate size or number of items.
+	Size() int
+	// Clear deletes all entries (used in merge/cleanup).
+	Clear() error
 }
 
 // ErrNotFound indicates that a key was not found in the state database.
@@ -39,6 +48,7 @@ func (db *InMemoryStateDB) Get(key []byte) ([]byte, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
+	// Return a copy to prevent modification of the underlying map slice
 	valueCopy := make([]byte, len(value))
 	copy(valueCopy, value)
 	return valueCopy, nil
@@ -48,6 +58,7 @@ func (db *InMemoryStateDB) Get(key []byte) ([]byte, error) {
 func (db *InMemoryStateDB) Put(key, value []byte) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	// Store copies to ensure immutability outside the DB
 	keyCopy := string(key)
 	valueCopy := make([]byte, len(value))
 	copy(valueCopy, value)
@@ -61,30 +72,50 @@ func (db *InMemoryStateDB) Delete(key []byte) error {
 	defer db.mu.Unlock()
 	keyString := string(key)
 	if _, ok := db.store[keyString]; !ok {
-		return ErrNotFound
+		return ErrNotFound // Or return nil if deleting non-existent key is okay
 	}
 	delete(db.store, keyString)
 	return nil
 }
 
-// Size returns an *approximate* size of the data stored in the in-memory map in bytes.
-// This is a rough estimate and doesn't account for map overhead perfectly.
-func (db *InMemoryStateDB) Size() int64 {
+// GetKeys returns all keys in the state DB.
+func (db *InMemoryStateDB) GetKeys() ([][]byte, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-
-	var totalSize int64 = 0
-	for k, v := range db.store {
-		// Size of key string header + key string data
-		totalSize += int64(unsafe.Sizeof(k)) + int64(len(k))
-		// Size of value slice header + value slice data
-		totalSize += int64(unsafe.Sizeof(v)) + int64(len(v))
+	keys := make([][]byte, 0, len(db.store))
+	for k := range db.store {
+		keyCopy := []byte(k)
+		keys = append(keys, keyCopy)
 	}
-	// Add approximate overhead for the map structure itself (highly variable)
-	// This is just a guess; real measurement is complex.
-	mapOverhead := int64(unsafe.Sizeof(db.store)) + int64(len(db.store)*16) // Guess 16 bytes overhead per entry
-	totalSize += mapOverhead
-
-	return totalSize
+	return keys, nil
 }
 
+// GetStateRoot provides a placeholder state root calculation.
+// TODO: Replace with actual SMT or Patricia Merkle Trie root calculation.
+func (db *InMemoryStateDB) GetStateRoot() ([]byte, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	// Extremely basic placeholder: hash of concatenated key-value pairs (sorted)
+	// This is NOT cryptographically secure or efficient like a proper Merkle Trie/SMT.
+	// Consider using a library like go-ethereum's trie package or a dedicated SMT lib.
+	if len(db.store) == 0 {
+		return EmptyMerkleRoot(), nil // Use the same empty root as transactions
+	}
+	// For a placeholder, maybe just return a hash of the number of items.
+	// This is NOT a real state root.
+	sizeBytes := []byte(fmt.Sprintf("%d", len(db.store)))
+	return SimpleHash(sizeBytes), nil
+}
+
+func (db *InMemoryStateDB) Size() int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return len(db.store)
+}
+
+func (db *InMemoryStateDB) Clear() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.store = make(map[string][]byte) // Re-initialize the map
+	return nil
+}

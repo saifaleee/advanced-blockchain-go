@@ -1,557 +1,736 @@
 package core
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
 	"math/big"
+	"sort"
+	"strconv"
 	"sync"
-	"sync/atomic" // For atomic metric updates
-	"time"        // For potential time-based metrics
+	"sync/atomic"
+	"time"
+
+	"github.com/stathat/consistent" // Import consistent hashing library
 )
 
-// ShardID represents the identifier for a shard.
-type ShardID uint
+// --- Shard ---
 
-// ShardMetrics holds load information for a shard.
+// ShardMetrics holds performance/load metrics for a shard.
 type ShardMetrics struct {
-	// Using atomic operations for thread-safe updates without locking the main shard mutex constantly
-	TransactionCount    atomic.Int64 // Number of transactions processed or currently in pool (adjust definition as needed)
-	StateSizeBytes      atomic.Int64 // Approximate size of the state data
-	LastBlockTimestamp  atomic.Int64 // Timestamp of the last block added
-	PendingTxCount      atomic.Int64 // Number of transactions currently in the pool
+	TxCount       atomic.Int64 // Number of transactions processed
+	StateSize     atomic.Int64 // Approximate size of the state DB (e.g., number of keys)
+	BlockCount    atomic.Int64 // Number of blocks mined
+	PendingTxPool atomic.Int64 // Number of transactions waiting in the pool
+	// Add other metrics like CPU/memory usage if needed
 }
 
-// Shard represents a partition of the blockchain's state and processing.
+// Shard represents a single shard in the blockchain.
 type Shard struct {
-	ID        ShardID
-	State     StateDB        // State specific to this shard (needs Size() method for metrics)
-	BlockChan chan *Block    // Channel to receive blocks for this shard
-	TxPool    []*Transaction // Simple transaction pool for the shard
-	Mu        sync.RWMutex   // Exported mutex for TxPool and potentially other direct access
-	Metrics   ShardMetrics   // Load metrics for dynamic sharding decisions
-	stopChan  chan struct{}  // Channel to signal shard shutdown (e.g., during merge)
+	ID       uint64
+	StateDB  StateDB        // Interface for state storage
+	TxPool   []*Transaction // Simple transaction pool (replace with more robust structure if needed)
+	mu       sync.RWMutex   // Protects TxPool and StateDB during certain operations like migration
+	Metrics  *ShardMetrics
+	stopChan chan struct{} // Channel to signal shard termination
 }
 
 // NewShard creates a new shard instance.
-func NewShard(id ShardID) *Shard {
+func NewShard(id uint64) *Shard {
+	db := NewInMemoryStateDB()               // Or initialize with persistent storage
+	initialStateRoot, _ := db.GetStateRoot() // Get initial empty state root
+	log.Printf("Initializing Shard %d with initial state root %x", id, initialStateRoot)
+
 	return &Shard{
-		ID:        id,
-		State:     NewInMemoryStateDB(),   // Each shard gets its own state DB
-		BlockChan: make(chan *Block, 100), // Buffered channel
-		TxPool:    make([]*Transaction, 0),
-		Metrics:   ShardMetrics{}, // Initialize metrics
-		stopChan:  make(chan struct{}),
+		ID:       id,
+		StateDB:  db,
+		TxPool:   make([]*Transaction, 0),
+		mu:       sync.RWMutex{}, // Initialize the mutex
+		Metrics:  &ShardMetrics{},
+		stopChan: make(chan struct{}),
 	}
 }
 
-// AddTransaction adds a transaction to the shard's pool and updates metrics.
-func (s *Shard) AddTransaction(tx *Transaction) {
-	s.Mu.Lock()
+// AddTransaction adds a transaction to the shard's pool.
+func (s *Shard) AddTransaction(tx *Transaction) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// TODO: Add more validation (e.g., signature, replay protection, format checks)
+	if tx == nil || tx.ID == nil {
+		return errors.New("cannot add nil or uninitialized transaction")
+	}
+	// Optional: Check if TX already exists?
 	s.TxPool = append(s.TxPool, tx)
-	pendingCount := len(s.TxPool)
-	s.Mu.Unlock() // Unlock before logging and atomic ops
-
-	s.Metrics.PendingTxCount.Store(int64(pendingCount)) // Update pending count
-	s.Metrics.TransactionCount.Add(1) // Increment total processed/added count
-
-	log.Printf("Shard %d: Added Tx %x to pool (Pending: %d)", s.ID, tx.ID, pendingCount)
+	s.Metrics.PendingTxPool.Store(int64(len(s.TxPool))) // Update metric
+	// log.Printf("Shard %d: Added TX %x to pool (pool size: %d)\n", s.ID, tx.ID, len(s.TxPool))
+	return nil
 }
 
-// GetTransactionsForBlock retrieves transactions and updates metrics.
+// GetTransactionsForBlock retrieves transactions for mining.
 func (s *Shard) GetTransactionsForBlock(maxTx int) []*Transaction {
-	s.Mu.Lock() // Lock TxPool access
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	count := len(s.TxPool)
-	if count == 0 {
-		s.Mu.Unlock()
-		s.Metrics.PendingTxCount.Store(0) // Ensure pending count is 0
-		return []*Transaction{}
-	}
 	if count > maxTx {
 		count = maxTx
 	}
+	if count == 0 {
+		return []*Transaction{}
+	}
 
+	// Select transactions based on some policy (e.g., FIFO, priority)
+	// Simple FIFO for now:
 	txs := make([]*Transaction, count)
 	copy(txs, s.TxPool[:count])
-	s.TxPool = s.TxPool[count:] // Remove retrieved transactions
-	pendingCount := len(s.TxPool)
 
-	s.Mu.Unlock() // Unlock before atomic ops
+	// Remove selected transactions from the pool
+	s.TxPool = s.TxPool[count:]
+	s.Metrics.PendingTxPool.Store(int64(len(s.TxPool))) // Update metric
 
-	s.Metrics.PendingTxCount.Store(int64(pendingCount)) // Update pending count after removal
-
+	// log.Printf("Shard %d: Retrieving %d TXs for block, %d remain in pool\n", s.ID, count, len(s.TxPool))
 	return txs
 }
 
-// GetTxPoolSize safely returns the current size of the transaction pool
-func (s *Shard) GetTxPoolSize() int {
-	// Use atomic load for quick read if strict consistency with Mu isn't needed here
-	// return int(s.Metrics.PendingTxCount.Load())
-	// Or use the mutex for guaranteed consistency with Add/Get:
-	s.Mu.RLock()
-	defer s.Mu.RUnlock()
-	return len(s.TxPool)
-}
-
-// UpdateStateSizeMetric updates the approximate state size metric.
-// This should be called periodically or after significant state changes.
-func (s *Shard) UpdateStateSizeMetric() {
-	// Check if StateDB supports Size() method
-	if sizeableDB, ok := s.State.(interface{ Size() int64 }); ok {
-		size := sizeableDB.Size()
-		s.Metrics.StateSizeBytes.Store(size)
-		// log.Printf("Shard %d: Updated state size metric to %d bytes", s.ID, size)
-	} else {
-		// log.Printf("Shard %d: StateDB does not support Size() method for metrics.", s.ID)
-		// Could approximate based on transaction count or other heuristics if needed
-	}
-}
-
-// UpdateLastBlockTimestamp updates the timestamp metric.
-func (s *Shard) UpdateLastBlockTimestamp(timestamp int64) {
-	s.Metrics.LastBlockTimestamp.Store(timestamp)
-}
-
-// Stop signals the shard to stop processing (e.g., before merging).
+// Stop signals the shard to stop processing.
 func (s *Shard) Stop() {
-	close(s.stopChan) // Signal shutdown
+	close(s.stopChan)
 	log.Printf("Shard %d: Stop signal received.", s.ID)
-	// Add logic here to gracefully stop any shard-specific goroutines if needed
+	// Add any other cleanup needed, e.g., persisting state if not in-memory
 }
 
-// --- Shard Manager ---
+// ApplyStateChanges applies transactions to the shard's state DB.
+// This should be called *before* calculating the final state root for a block.
+// Returns the calculated state root AFTER applying transactions.
+func (s *Shard) ApplyStateChanges(transactions []*Transaction) ([]byte, error) {
+	// Lock the shard during state modification. If StateDB is thread-safe internally,
+	// we might only need to lock TxPool access, but locking here ensures atomicity
+	// of applying a block's worth of changes relative to other shard operations like migration.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	originalSize := s.StateDB.Size()
+
+	// Apply transactions to state (example logic, adapt based on TX meaning)
+	for _, tx := range transactions {
+		// Simple example: Use TX ID as key, Data as value for IntraShard/Initiate
+		// For Apply, maybe use original TX ID or a specific key from the data.
+		key := tx.Hash()
+		value := tx.Data // Default value
+
+		// In a real system, logic depends heavily on transaction content:
+		// - Transfers: Debit sender, credit receiver (check balances)
+		// - Contract calls: Execute VM, update contract storage
+		// - CrossShardApply: Use data from receipt (e.g., credit receiver)
+
+		if tx.Type == CrossShardTxFinalize {
+			log.Printf("Shard %d: Applying state for cross-shard TX %x (from source receipt)\n", s.ID, tx.ID)
+			// Example: Use specific key if carried in TX data, otherwise use TX hash
+			err := s.StateDB.Put(key, value)
+			if err != nil {
+				log.Printf("Shard %d: Error applying state for CrossShardTxFinalize TX %x: %v\n", s.ID, tx.ID, err)
+				// Consider revert strategy or error handling
+				return nil, fmt.Errorf("failed to apply state for CrossShardTxFinalize tx %x: %w", tx.ID, err)
+			}
+		} else if tx.Type == IntraShard || tx.Type == CrossShardTxInit {
+			// Apply standard intra-shard or the initiation part of cross-shard
+			// log.Printf("Shard %d: Applying state for TX %x (Type: %d)\n", s.ID, tx.ID, tx.Type)
+			err := s.StateDB.Put(key, value) // Example state change
+			if err != nil {
+				log.Printf("Shard %d: Error applying state for TX %x: %v\n", s.ID, tx.ID, err)
+				return nil, fmt.Errorf("failed to apply state for tx %x: %w", tx.ID, err)
+			}
+		} else {
+			log.Printf("Shard %d: Skipping state application for unknown TX type %d (TX ID: %x)", s.ID, tx.Type, tx.ID)
+		}
+		s.Metrics.TxCount.Add(1) // Increment processed TX count
+	}
+
+	// Update state size metric (based on number of keys for InMemoryStateDB)
+	stateSize := s.StateDB.Size()
+	s.Metrics.StateSize.Store(int64(stateSize))
+
+	// Calculate the new state root *after* all changes for this block
+	stateRoot, err := s.StateDB.GetStateRoot()
+	if err != nil {
+		log.Printf("Shard %d: Error calculating state root after applying %d txs: %v\n", s.ID, len(transactions), err)
+		return nil, fmt.Errorf("failed to calculate state root: %w", err)
+	}
+
+	log.Printf("Shard %d: Applied %d transactions. State size %d -> %d. New state root: %x\n", s.ID, len(transactions), originalSize, stateSize, stateRoot)
+	return stateRoot, nil
+}
+
+// --- ShardManager ---
 
 // ShardManagerConfig holds configuration for dynamic sharding.
 type ShardManagerConfig struct {
-	SplitTxThreshold     int64 // Trigger split if PendingTxCount exceeds this
-	MergeTxThreshold     int64 // Consider merge if PendingTxCount below this
-	SplitStateThreshold  int64 // Trigger split if StateSizeBytes exceeds this
-	MergeStateThreshold  int64 // Consider merge if StateSizeBytes below this
-	CheckInterval        time.Duration // How often to check shard metrics
-	MaxShards            uint          // Maximum number of shards allowed
-	MinShards            uint          // Minimum number of shards allowed
+	SplitThresholdStateSize   int64         // Trigger split if StateSize exceeds this
+	SplitThresholdTxPool      int64         // Trigger split if PendingTxPool exceeds this
+	MergeThresholdStateSize   int64         // Trigger merge if StateSize drops below this (shard A)
+	MergeTargetThresholdSize  int64         // AND target shard B is also below this
+	CheckInterval             time.Duration // How often to check metrics
+	NumReplicasConsistentHash int           // Number of virtual nodes for consistent hashing
+	MaxShards                 int           // Maximum number of shards allowed
+	MinShards                 int           // Minimum number of shards allowed
 }
 
-// DefaultShardManagerConfig provides sensible defaults.
+// DefaultShardManagerConfig returns the default configuration for ShardManager
 func DefaultShardManagerConfig() ShardManagerConfig {
 	return ShardManagerConfig{
-		SplitTxThreshold:     1000, // Example: Split if > 1000 pending tx
-		MergeTxThreshold:     50,   // Example: Merge if < 50 pending tx
-		SplitStateThreshold:  1024 * 1024 * 100, // Example: Split if > 100MB state
-		MergeStateThreshold:  1024 * 1024 * 10,  // Example: Merge if < 10MB state
-		CheckInterval:        30 * time.Second,  // Example: Check every 30 seconds
-		MaxShards:            256,               // Example: Limit max shards
-		MinShards:            1,                 // Example: Must have at least 1 shard
+		SplitThresholdStateSize:   1000,             // Split when state size exceeds 1000 entries
+		SplitThresholdTxPool:      500,              // Split when TX pool exceeds 500 pending TXs
+		MergeThresholdStateSize:   200,              // Consider merge when state size falls below 200
+		MergeTargetThresholdSize:  300,              // And target shard is below 300
+		CheckInterval:             time.Second * 10, // Check metrics every 10 seconds
+		NumReplicasConsistentHash: 10,               // 10 virtual nodes per shard
+		MaxShards:                 64,               // Maximum 64 shards
+		MinShards:                 1,                // At least 1 shard
 	}
 }
 
-// ShardManager manages the different shards in the blockchain.
+// ShardManager manages all shards, routing, and dynamic resizing.
 type ShardManager struct {
-	Shards         map[ShardID]*Shard
-	ShardCount     uint // Current number of active shards (use atomic for reads outside lock?)
-	Config         ShardManagerConfig
-	Mu             sync.RWMutex
-	RoutingTable   map[ShardID]*Shard // Fast lookup for active shards
-	nextShardID    ShardID            // Counter for assigning new shard IDs
-	managementStop chan struct{}      // Channel to stop the management loop
-	IsManaging     atomic.Bool        // Flag to indicate if management loop is running
+	shards       map[uint64]*Shard
+	shardIDs     []uint64     // Keep track of active shard IDs (sorted for easier merge logic)
+	mu           sync.RWMutex // Protects shards map, shardIDs slice, and consistent hash ring
+	config       ShardManagerConfig
+	nextShardID  uint64                 // Counter for assigning new shard IDs
+	consistent   *consistent.Consistent // Consistent hashing ring
+	stopChan     chan struct{}
+	managementWg sync.WaitGroup
+	isManaging   atomic.Bool // Flag to prevent concurrent management runs
+	// Blockchain reference needed for state migration or other cross-component actions
+	bc *Blockchain // Pointer back to the main Blockchain instance (set during init)
 }
 
-// NewShardManager creates and initializes the shard manager.
-func NewShardManager(initialShardCount uint, config ShardManagerConfig) (*ShardManager, error) {
-	if initialShardCount == 0 || initialShardCount < config.MinShards || initialShardCount > config.MaxShards {
-		return nil, fmt.Errorf("initial shard count (%d) must be between MinShards (%d) and MaxShards (%d)",
-			initialShardCount, config.MinShards, config.MaxShards)
+// NewShardManager creates a new shard manager.
+func NewShardManager(config ShardManagerConfig, initialShards int) (*ShardManager, error) {
+	if initialShards <= 0 || initialShards < config.MinShards {
+		return nil, fmt.Errorf("initialShards (%d) must be positive and >= MinShards (%d)", initialShards, config.MinShards)
 	}
+	if config.MaxShards > 0 && initialShards > config.MaxShards {
+		return nil, fmt.Errorf("initialShards (%d) cannot exceed MaxShards (%d)", initialShards, config.MaxShards)
+	}
+	if config.MergeThresholdStateSize >= config.SplitThresholdStateSize || config.MergeTargetThresholdSize >= config.SplitThresholdStateSize {
+		log.Printf("Warning: Merge thresholds might overlap with split thresholds, review config.")
+	}
+
 	sm := &ShardManager{
-		Shards:         make(map[ShardID]*Shard),
-		ShardCount:     initialShardCount,
-		Config:         config,
-		RoutingTable:   make(map[ShardID]*Shard),
-		nextShardID:    ShardID(initialShardCount), // Start assigning IDs after initial ones
-		managementStop: make(chan struct{}),
+		shards:     make(map[uint64]*Shard),
+		shardIDs:   make([]uint64, 0, initialShards),
+		config:     config,
+		consistent: consistent.New(),
+		stopChan:   make(chan struct{}),
 	}
-	for i := uint(0); i < initialShardCount; i++ {
-		shardID := ShardID(i)
+	sm.consistent.NumberOfReplicas = config.NumReplicasConsistentHash
+	if sm.consistent.NumberOfReplicas <= 0 {
+		sm.consistent.NumberOfReplicas = 20 // Default if not set
+		log.Printf("ShardManager: NumReplicasConsistentHash not set or invalid, defaulting to %d", sm.consistent.NumberOfReplicas)
+	}
+
+	for i := 0; i < initialShards; i++ {
+		shardID := sm.nextShardID
+		sm.nextShardID++
 		shard := NewShard(shardID)
-		sm.Shards[shardID] = shard
-		sm.RoutingTable[shardID] = shard
+		sm.shards[shardID] = shard
+		sm.shardIDs = append(sm.shardIDs, shardID)
+		sm.consistent.Add(fmt.Sprintf("%d", shardID)) // Add shard ID as string to hash ring
 	}
-	log.Printf("ShardManager initialized with %d shards.\n", initialShardCount)
+	sort.Slice(sm.shardIDs, func(i, j int) bool { return sm.shardIDs[i] < sm.shardIDs[j] }) // Keep sorted
+
+	log.Printf("ShardManager initialized with %d shards. Shard IDs: %v. Hash ring members: %v\n", len(sm.shards), sm.shardIDs, sm.consistent.Members())
 	return sm, nil
 }
 
-// StartManagementLoop periodically checks shard metrics and triggers splits/merges.
+// SetBlockchainLink allows linking the manager back to the Blockchain instance.
+// Needed for operations that require broader context (e.g., broadcasting shard changes).
+func (sm *ShardManager) SetBlockchainLink(bc *Blockchain) {
+	sm.bc = bc
+}
+
+// GetShard retrieves a shard by ID (read-locked).
+func (sm *ShardManager) GetShard(id uint64) (*Shard, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	shard, ok := sm.shards[id]
+	return shard, ok
+}
+
+// GetAllShardIDs returns a sorted slice of all active shard IDs (read-locked).
+func (sm *ShardManager) GetAllShardIDs() []uint64 {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	// Return a copy to prevent external modification and ensure it's sorted
+	idsCopy := make([]uint64, len(sm.shardIDs))
+	copy(idsCopy, sm.shardIDs)
+	// Should already be sorted, but ensure it just in case
+	sort.Slice(idsCopy, func(i, j int) bool { return idsCopy[i] < idsCopy[j] })
+	return idsCopy
+}
+
+// DetermineShard uses consistent hashing to find the responsible shard for a given key (read-locked).
+func (sm *ShardManager) DetermineShard(key []byte) (uint64, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	if len(sm.shardIDs) == 0 || len(sm.consistent.Members()) == 0 {
+		log.Printf("DetermineShard: Cannot route key %x, no active shards or empty hash ring.", key)
+		return 0, errors.New("no active shards available for routing")
+	}
+
+	// Use consistent hashing
+	keyString := string(key) // Consistent hashing library uses strings
+	shardIDStr, err := sm.consistent.Get(keyString)
+	if err != nil {
+		// This can happen if the ring is empty, but we checked. Could be another issue.
+		log.Printf("Error determining shard via consistent hash for key %x (%s): %v. Ring size: %d, members: %v", key, keyString, err, len(sm.consistent.Members()), sm.consistent.Members())
+		// Fallback: Use simple modulo of the key's numeric representation against the number of shards
+		// This isn't stable during dynamic changes but provides a last resort.
+		numShards := len(sm.shardIDs)
+		if numShards > 0 {
+			fallbackIndex := int(new(big.Int).SetBytes(key).Uint64() % uint64(numShards))
+			fallbackShardID := sm.shardIDs[fallbackIndex] // Assumes shardIDs is sorted and reflects map keys
+			log.Printf("Falling back to modulo routing for key %x, index %d -> shard %d", key, fallbackIndex, fallbackShardID)
+			return fallbackShardID, nil
+		}
+		return 0, fmt.Errorf("consistent hashing failed and no shards available for fallback: %w", err)
+	}
+
+	// Parse the string ID back to uint64
+	shardID, err := strconv.ParseUint(shardIDStr, 10, 64)
+	if err != nil {
+		log.Printf("Error parsing shard ID '%s' from consistent hash result: %v", shardIDStr, err)
+		// Fallback like above? This indicates a mismatch between ring members and expected format.
+		numShards := len(sm.shardIDs)
+		if numShards > 0 {
+			fallbackIndex := int(new(big.Int).SetBytes(key).Uint64() % uint64(numShards))
+			fallbackShardID := sm.shardIDs[fallbackIndex]
+			log.Printf("Falling back to modulo routing due to parse error, index %d -> shard %d", fallbackIndex, fallbackShardID)
+			return fallbackShardID, nil
+		}
+		return 0, fmt.Errorf("failed to parse shard ID from consistent hash result: %w", err)
+	}
+
+	// Sanity check: Does the shard actually exist in our map? It should!
+	if _, exists := sm.shards[shardID]; !exists {
+		log.Printf("CRITICAL: Consistent hash routed key %x to non-existent shard ID %d! Ring members: %v, Map keys: %v", key, shardID, sm.consistent.Members(), sm.shardIDs)
+		// This indicates a serious inconsistency. Maybe force rebuild or error out.
+		// Fallback for now:
+		numShards := len(sm.shardIDs)
+		if numShards > 0 {
+			fallbackIndex := int(new(big.Int).SetBytes(key).Uint64() % uint64(numShards))
+			fallbackShardID := sm.shardIDs[fallbackIndex]
+			log.Printf("Falling back to modulo routing due to inconsistent state, index %d -> shard %d", fallbackIndex, fallbackShardID)
+			return fallbackShardID, nil
+		}
+		return 0, fmt.Errorf("consistent hash returned non-existent shard ID %d", shardID)
+	}
+
+	// log.Printf("Routed key %x to shard %d via consistent hashing", key, shardID)
+	return shardID, nil
+}
+
+// --- Dynamic Sharding Logic ---
+
+// StartManagementLoop starts the background process to check shard metrics and trigger splits/merges.
 func (sm *ShardManager) StartManagementLoop() {
-	if !sm.IsManaging.CompareAndSwap(false, true) {
-		log.Println("Shard management loop already running.")
+	if sm.config.CheckInterval <= 0 {
+		log.Println("ShardManager management loop disabled (CheckInterval <= 0).")
 		return
 	}
-	log.Println("Starting shard management loop...")
+	log.Println("Starting ShardManager management loop...")
+	sm.managementWg.Add(1)
 	go func() {
-		ticker := time.NewTicker(sm.Config.CheckInterval)
+		defer sm.managementWg.Done()
+		ticker := time.NewTicker(sm.config.CheckInterval)
 		defer ticker.Stop()
-		defer func() {
-			sm.IsManaging.Store(false) // Ensure flag is reset on exit
-			log.Println("Shard management loop stopped.")
-		}()
 
 		for {
 			select {
+			case <-sm.stopChan:
+				log.Println("Stopping ShardManager management loop.")
+				return
 			case <-ticker.C:
-				log.Println("Checking shard metrics for dynamic management...")
-				sm.CheckAndManageShards()
-			case <-sm.managementStop:
-				return // Exit loop
+				// Prevent overlapping management cycles if one takes too long
+				if sm.isManaging.CompareAndSwap(false, true) {
+					// log.Println("Checking shard metrics for potential split/merge...")
+					sm.CheckAndManageShards()
+					sm.isManaging.Store(false) // Release the lock
+				} else {
+					log.Println("Skipping management cycle, previous one still running.")
+				}
 			}
 		}
 	}()
 }
 
-// StopManagementLoop signals the management loop to terminate.
+// StopManagementLoop stops the background management process and managed shards.
 func (sm *ShardManager) StopManagementLoop() {
-	if sm.IsManaging.CompareAndSwap(true, false) { // Only close if running
-		close(sm.managementStop)
-		log.Println("Stop signal sent to shard management loop.")
-	} else {
-		log.Println("Shard management loop not running.")
+	close(sm.stopChan)     // Signal the loop to stop
+	sm.managementWg.Wait() // Wait for the loop goroutine to finish
+	log.Println("ShardManager management loop stopped.")
+
+	// Stop all managed shards
+	sm.mu.RLock() // Need read lock to access shards map
+	idsToStop := make([]uint64, 0, len(sm.shards))
+	for id := range sm.shards {
+		idsToStop = append(idsToStop, id)
 	}
+	sm.mu.RUnlock()
+
+	log.Printf("Stopping all managed shards: %v", idsToStop)
+	for _, shardID := range idsToStop {
+		if shard, ok := sm.GetShard(shardID); ok { // Use GetShard for read lock safety
+			shard.Stop()
+		}
+	}
+	log.Println("All managed shards stopped.")
 }
 
-// CheckAndManageShards iterates through shards and triggers split/merge based on config.
+// CheckAndManageShards iterates through shards and triggers splits or merges based on config thresholds.
+// This function acquires the main write lock (`sm.mu`) to ensure atomicity of checking and potentially modifying the shard set.
 func (sm *ShardManager) CheckAndManageShards() {
-	sm.Mu.Lock() // Lock for the duration of checking and potentially modifying shards map/count
-	defer sm.Mu.Unlock()
+	sm.mu.Lock() // Acquire write lock for the entire check and potential modification
+	defer sm.mu.Unlock()
 
-	// Flag to track if any splits happened during this check
-	splitOccurred := false
+	// Create copies to iterate over, preventing issues if slice/map changes during iteration
+	currentShardIDs := make([]uint64, len(sm.shardIDs))
+	copy(currentShardIDs, sm.shardIDs)
 
-	// --- Check for Splits ---
-	// Create a list of shard IDs to iterate over to avoid issues if map changes during iteration (though lock prevents this here)
-	currentShardIDs := make([]ShardID, 0, len(sm.Shards))
-	for id := range sm.Shards {
-		currentShardIDs = append(currentShardIDs, id)
+	log.Printf("Checking metrics for %d shards: %v", len(currentShardIDs), currentShardIDs)
+
+	splitTriggered := false
+	mergeTriggered := false
+
+	// Check for Splits first (usually higher priority than merges)
+	for _, shardID := range currentShardIDs {
+		// Re-check existence in case a merge removed it during a previous iteration (unlikely with full lock, but good practice)
+		shard, ok := sm.shards[shardID]
+		if !ok {
+			continue // Shard was removed
+		}
+
+		metrics := shard.Metrics
+		stateSize := metrics.StateSize.Load()
+		txPoolSize := metrics.PendingTxPool.Load()
+		// log.Printf("Shard %d Metrics - StateSize: %d, TxPoolSize: %d", shardID, stateSize, txPoolSize)
+
+		// Check Split condition
+		needsSplit := (sm.config.SplitThresholdStateSize > 0 && stateSize > sm.config.SplitThresholdStateSize) ||
+			(sm.config.SplitThresholdTxPool > 0 && txPoolSize > sm.config.SplitThresholdTxPool)
+
+		if needsSplit {
+			if sm.config.MaxShards > 0 && len(sm.shards) >= sm.config.MaxShards {
+				log.Printf("Shard %d (%d keys, %d pool) meets split threshold, but MaxShards (%d) reached. Skipping split.",
+					shardID, stateSize, txPoolSize, sm.config.MaxShards)
+				continue // Cannot split further
+			}
+
+			log.Printf("Shard %d (%d keys, %d pool) meets split threshold. Triggering split.",
+				shardID, stateSize, txPoolSize)
+			err := sm.triggerSplitUnsafe(shardID) // Call unsafe version as we hold the lock
+			if err != nil {
+				log.Printf("Error triggering split for shard %d: %v", shardID, err)
+				// Decide if we should continue or stop the management cycle on error
+			} else {
+				splitTriggered = true
+				// Important: After a split, the shard list and hash ring have changed.
+				// Re-evaluating merge conditions immediately might be complex.
+				// Simplest approach: break after the first successful split/merge in a cycle.
+				break // Exit the loop after one split
+			}
+		}
 	}
 
-	for _, shardID := range currentShardIDs {
-		shard, exists := sm.Shards[shardID]
-		if !exists {
-			continue // Shard might have been merged in a previous iteration of this check
-		}
+	// If a split happened, we stop this cycle to allow stabilization/re-evaluation next time.
+	if splitTriggered {
+		log.Println("Split occurred, ending management cycle.")
+		return
+	}
 
-		// Update metrics before checking (especially state size)
-		shard.UpdateStateSizeMetric()
+	// Check for Merges if no split occurred
+	// Sort shards by load (e.g., state size) to find candidates easily? Or just iterate.
+	// Simple approach: Iterate and find the first pair eligible for merge.
+	// Needs at least 2 shards to potentially merge.
+	if len(sm.shards) > sm.config.MinShards {
+		// Iterate through shards again (or use a sorted list if available)
+		for i := 0; i < len(sm.shardIDs); i++ {
+			shardAID := sm.shardIDs[i]
+			shardA, okA := sm.shards[shardAID]
+			if !okA {
+				continue
+			}
 
-		pendingTx := shard.Metrics.PendingTxCount.Load()
-		stateSize := shard.Metrics.StateSizeBytes.Load()
+			// Check if shard A is below merge threshold
+			stateSizeA := shardA.Metrics.StateSize.Load()
+			// txPoolSizeA := shardA.Metrics.PendingTxPool.Load() // Can add pool size to merge criteria too
+			if sm.config.MergeThresholdStateSize > 0 && stateSizeA < sm.config.MergeThresholdStateSize {
 
-		// Check split conditions
-		needsSplit := false
-		if sm.Config.SplitTxThreshold > 0 && pendingTx > sm.Config.SplitTxThreshold {
-			log.Printf("Shard %d needs split: Pending Txs (%d) > Threshold (%d)",
-				shardID, pendingTx, sm.Config.SplitTxThreshold)
-			needsSplit = true
-		}
-		if !needsSplit && sm.Config.SplitStateThreshold > 0 && stateSize > sm.Config.SplitStateThreshold {
-			log.Printf("Shard %d needs split: State Size (%d) > Threshold (%d)",
-				shardID, stateSize, sm.Config.SplitStateThreshold)
-			needsSplit = true
-		}
+				// Find a suitable merge partner (e.g., the *next* shard in the sorted list)
+				// Ensure we don't merge the last shard with the first one if using simple adjacency.
+				var shardBID uint64
+				var shardB *Shard
+				var okB bool
 
-		// Trigger split if needed and possible
-		if needsSplit {
-			if sm.ShardCount >= sm.Config.MaxShards {
-				log.Printf("Split needed for Shard %d, but MaxShards (%d) reached. Skipping split.",
-					shardID, sm.Config.MaxShards)
-			} else {
-				// Call the actual split function (which is still mostly placeholder)
-				err := sm.triggerSplitUnsafe(shardID) // Use unsafe version as lock is already held
-				if err != nil {
-					log.Printf("Error triggering split for shard %d: %v", shardID, err)
-				} else {
-					// If split successful, set flag to skip merge checks in this cycle
-					splitOccurred = true
+				if i+1 < len(sm.shardIDs) { // Try merging with the next shard
+					shardBID = sm.shardIDs[i+1]
+					shardB, okB = sm.shards[shardBID]
+				} else if i > 0 && len(sm.shardIDs) > sm.config.MinShards { // Try merging last with previous if allowed
+					// Avoid merging last two if result is below min shards? Check needed.
+					// shardBID = sm.shardIDs[i-1]
+					// shardB, okB = sm.shards[shardBID]
+					// Merging with previous can be more complex; sticking to merging A->B (i -> i+1) is simpler
+					okB = false // Don't merge last shard with previous in this simple logic
+				}
+
+				if okB {
+					// Check if shard B is also below the target threshold
+					stateSizeB := shardB.Metrics.StateSize.Load()
+					if sm.config.MergeTargetThresholdSize > 0 && stateSizeB < sm.config.MergeTargetThresholdSize {
+						// Both shards are underutilized, trigger merge
+						log.Printf("Shards %d (%d keys) and %d (%d keys) meet merge thresholds. Triggering merge (%d into %d).",
+							shardAID, stateSizeA, shardBID, stateSizeB, shardBID, shardAID)
+
+						// Decide merge direction: merge B into A seems more natural with the loop structure
+						err := sm.triggerMergeUnsafe(shardAID, shardBID) // Merge B (shardBID) into A (shardAID)
+						if err != nil {
+							log.Printf("Error triggering merge for shards %d and %d: %v", shardAID, shardBID, err)
+						} else {
+							mergeTriggered = true
+							break // Exit loop after one merge
+						}
+					}
 				}
 			}
 		}
 	}
 
-	// --- Check for Merges ---
-	// Skip merge checks if a split occurred in this cycle or merging is disabled (MergeTxThreshold = 0)
-	if splitOccurred || sm.Config.MergeTxThreshold <= 0 {
-		return
+	if mergeTriggered {
+		log.Println("Merge occurred, ending management cycle.")
+	} else if !splitTriggered {
+		// log.Println("No split or merge conditions met in this cycle.")
 	}
-	
-	// Merge logic is more complex: needs to find suitable pairs of shards.
-	// Simple approach: find any shard below threshold and try to merge it with a neighbor (if topology is defined)
-	// or another low-load shard.
-	// For now, let's just identify shards that *could* be merged.
+}
 
-	mergeCandidates := make([]ShardID, 0)
-	currentShardIDs = make([]ShardID, 0, len(sm.Shards)) // Refresh list in case splits occurred
-	for id := range sm.Shards {
-		currentShardIDs = append(currentShardIDs, id)
+// triggerSplitUnsafe performs the split operation. Assumes caller holds the write lock (`sm.mu`).
+func (sm *ShardManager) triggerSplitUnsafe(sourceShardID uint64) error {
+	log.Printf("--- Starting Split for Shard %d ---", sourceShardID)
+	sourceShard, ok := sm.shards[sourceShardID]
+	if !ok {
+		return fmt.Errorf("source shard %d not found for split", sourceShardID)
 	}
 
-	for _, shardID := range currentShardIDs {
-		shard, exists := sm.Shards[shardID]
-		if !exists {
+	// 1. Create the new shard
+	newShardID := sm.nextShardID
+	sm.nextShardID++
+	newShard := NewShard(newShardID)
+	log.Printf("Split: Created new Shard %d", newShardID)
+
+	// 2. Temporarily add the new shard to the consistent hash ring to determine new ownership
+	newShardIDStr := fmt.Sprintf("%d", newShardID)
+	sm.consistent.Add(newShardIDStr)
+	log.Printf("Split: Temporarily added %d to hash ring. Members: %v", newShardID, sm.consistent.Members())
+
+	// 3. Perform State Migration
+	// Lock the source and new shards during migration.
+	// Note: Global lock `sm.mu` is already held. Need shard-level locks if StateDB isn't fully thread-safe
+	// or to prevent concurrent block processing during migration.
+	sourceShard.mu.Lock()
+	newShard.mu.Lock()
+	defer sourceShard.mu.Unlock()
+	defer newShard.mu.Unlock()
+
+	log.Printf("Split: Migrating state from Shard %d to Shard %d...", sourceShardID, newShardID)
+	keysToMigrate, err := sourceShard.StateDB.GetKeys()
+	if err != nil {
+		// Revert adding to hash ring?
+		sm.consistent.Remove(newShardIDStr)
+		log.Printf("Split: Error getting keys from source shard %d: %v. Reverted hash ring add.", sourceShardID, err)
+		return fmt.Errorf("failed to get keys from source shard %d for migration: %w", sourceShardID, err)
+	}
+
+	migratedCount := 0
+	failedMigrationCount := 0
+	keysToDelete := [][]byte{}
+
+	for _, key := range keysToMigrate {
+		// Determine which shard *should* own this key with the *new* ring configuration
+		targetShardID, routeErr := sm.DetermineShard(key) // Use DetermineShard with the updated ring
+		if routeErr != nil {
+			log.Printf("Split Migration Error: Could not determine target shard for key %x: %v. Skipping migration for this key.", key, routeErr)
+			failedMigrationCount++
+			continue // Skip this key
+		}
+
+		if targetShardID == newShardID {
+			// This key belongs to the new shard, migrate it.
+			value, getErr := sourceShard.StateDB.Get(key)
+			if getErr != nil {
+				log.Printf("Split Migration Error: Failed to get value for key %x from source shard %d: %v", key, sourceShardID, getErr)
+				failedMigrationCount++
+				continue // Skip this key
+			}
+
+			putErr := newShard.StateDB.Put(key, value)
+			if putErr != nil {
+				log.Printf("Split Migration Error: Failed to put key %x into new shard %d: %v", key, newShardID, putErr)
+				failedMigrationCount++
+				// Should we attempt to keep it in the source? Or just log? Log for now.
+			} else {
+				// Successfully moved, mark for deletion from source shard
+				keysToDelete = append(keysToDelete, key)
+				migratedCount++
+			}
+		}
+		// Else: Key still belongs to the source shard (or potentially another shard if >2 shards involved, though split usually is 1->2)
+	}
+
+	log.Printf("Split Migration: Attempted to migrate %d keys. %d successfully migrated to shard %d. %d failed. %d marked for deletion from shard %d.",
+		len(keysToMigrate), migratedCount, newShardID, failedMigrationCount, len(keysToDelete), sourceShardID)
+
+	// Delete migrated keys from the source shard
+	deletedCount := 0
+	failedDeleteCount := 0
+	for _, key := range keysToDelete {
+		delErr := sourceShard.StateDB.Delete(key)
+		if delErr != nil {
+			log.Printf("Split Migration Error: Failed to delete migrated key %x from source shard %d: %v", key, sourceShardID, delErr)
+			failedDeleteCount++
+		} else {
+			deletedCount++
+		}
+	}
+	log.Printf("Split Migration: Deleted %d keys from source shard %d. %d failures.", deletedCount, sourceShardID, failedDeleteCount)
+
+	if failedMigrationCount > 0 || failedDeleteCount > 0 {
+		// This indicates potential data inconsistency. A real system needs robust recovery/retry.
+		log.Printf("WARNING: Split for shard %d completed with migration/deletion errors.", sourceShardID)
+		// Proceeding anyway in this PoC, but flag the issue.
+	}
+
+	// Update metrics (approximate, as sizes change during migration)
+	sourceShard.Metrics.StateSize.Store(int64(sourceShard.StateDB.Size()))
+	newShard.Metrics.StateSize.Store(int64(newShard.StateDB.Size()))
+	log.Printf("Split: Updated state sizes - Shard %d: %d keys, Shard %d: %d keys",
+		sourceShardID, sourceShard.Metrics.StateSize.Load(), newShardID, newShard.Metrics.StateSize.Load())
+
+	// 4. Finalize: Add new shard to the main map and ID list
+	sm.shards[newShardID] = newShard
+	sm.shardIDs = append(sm.shardIDs, newShardID)
+	sort.Slice(sm.shardIDs, func(i, j int) bool { return sm.shardIDs[i] < sm.shardIDs[j] }) // Keep sorted
+
+	log.Printf("--- Split Complete for Shard %d -> %d, %d --- New Shard IDs: %v", sourceShardID, sourceShardID, newShardID, sm.shardIDs)
+
+	// TODO: Need mechanism to notify other parts of the system (e.g., network layer, other nodes) about the shard change.
+	// Maybe call a method on sm.bc if it's linked.
+
+	return nil
+}
+
+// triggerMergeUnsafe performs the merge operation. Merges `shardBID` into `shardAID`. Assumes caller holds the write lock (`sm.mu`).
+func (sm *ShardManager) triggerMergeUnsafe(shardAID, shardBID uint64) error {
+	log.Printf("--- Starting Merge of Shard %d into Shard %d ---", shardBID, shardAID)
+	if shardAID == shardBID {
+		return errors.New("cannot merge a shard into itself")
+	}
+
+	shardA, okA := sm.shards[shardAID]
+	shardB, okB := sm.shards[shardBID]
+
+	if !okA {
+		return fmt.Errorf("target shard %d for merge not found", shardAID)
+	}
+	if !okB {
+		return fmt.Errorf("source shard %d for merge not found", shardBID)
+	}
+
+	// 1. Perform State Migration (Move all state from B to A)
+	// Lock both shards during migration.
+	shardA.mu.Lock()
+	shardB.mu.Lock()
+	defer shardA.mu.Unlock()
+	defer shardB.mu.Unlock()
+
+	log.Printf("Merge: Migrating state from Shard %d to Shard %d...", shardBID, shardAID)
+	keysToMigrate, err := shardB.StateDB.GetKeys()
+	if err != nil {
+		log.Printf("Merge Error: Failed to get keys from source shard %d: %v", shardBID, err)
+		// Decide if merge should proceed or fail. Failing is safer.
+		return fmt.Errorf("failed to get keys from shard %d for merge: %w", shardBID, err)
+	}
+
+	migratedCount := 0
+	failedMigrationCount := 0
+	for _, key := range keysToMigrate {
+		value, getErr := shardB.StateDB.Get(key)
+		if getErr != nil {
+			log.Printf("Merge Migration Error: Failed to get value for key %x from source shard %d: %v", key, shardBID, getErr)
+			failedMigrationCount++
 			continue
 		}
 
-		pendingTx := shard.Metrics.PendingTxCount.Load()
-		stateSize := shard.Metrics.StateSizeBytes.Load()
-
-		// Check merge conditions (both must be below threshold)
-		canMerge := false
-		if sm.Config.MergeTxThreshold > 0 && pendingTx < sm.Config.MergeTxThreshold &&
-			sm.Config.MergeStateThreshold > 0 && stateSize < sm.Config.MergeStateThreshold {
-			canMerge = true
-		} else if sm.Config.MergeTxThreshold > 0 && pendingTx < sm.Config.MergeTxThreshold && sm.Config.MergeStateThreshold <= 0 {
-			// Only Tx threshold matters
-			canMerge = true
-		} else if sm.Config.MergeStateThreshold > 0 && stateSize < sm.Config.MergeStateThreshold && sm.Config.MergeTxThreshold <= 0 {
-			// Only State threshold matters
-			canMerge = true
-		}
-
-		if canMerge {
-			if sm.ShardCount > sm.Config.MinShards {
-				mergeCandidates = append(mergeCandidates, shardID)
-			} else {
-				// log.Printf("Shard %d is below merge threshold, but MinShards (%d) reached. Cannot merge.",
-				// 	shardID, sm.Config.MinShards)
-			}
-		}
-	}
-
-	// Simple pairing logic: Try merging adjacent candidates if possible
-	if len(mergeCandidates) >= 2 {
-		// Need a defined topology or pairing strategy. Let's try merging the first two candidates found.
-		shardID1 := mergeCandidates[0]
-		shardID2 := mergeCandidates[1]
-
-		log.Printf("Potential merge candidates identified: %v. Attempting merge for %d and %d.", mergeCandidates, shardID1, shardID2)
-		// Ensure both shards still exist (might have changed if splits happened)
-		if _, ok1 := sm.Shards[shardID1]; ok1 {
-			if _, ok2 := sm.Shards[shardID2]; ok2 {
-				// Call the actual merge function (mostly placeholder)
-				err := sm.triggerMergeUnsafe(shardID1, shardID2) // Use unsafe version
-				if err != nil {
-					log.Printf("Error triggering merge for shards %d and %d: %v", shardID1, shardID2, err)
-				} else {
-					// Merge successful, potentially stop checking for merges this round
-					// Or update mergeCandidates and continue
-				}
-			}
-		}
-	}
-}
-
-// DetermineShard maps data to a ShardID.
-// WARNING: Simple modulo routing breaks down with dynamic shard counts unless remapping occurs.
-// A production system needs consistent hashing or range-based routing.
-func (sm *ShardManager) DetermineShard(data []byte) ShardID {
-	sm.Mu.RLock()
-	currentShardCount := sm.ShardCount // Read count under lock
-	sm.Mu.RUnlock()
-
-	if currentShardCount == 0 {
-		log.Panic("Shard count is zero, cannot determine shard.")
-	}
-	hash := sha256.Sum256(data)
-	val := new(big.Int).SetBytes(hash[:8])
-	shardIndex := val.Mod(val, big.NewInt(int64(currentShardCount))).Uint64()
-
-	// Need to map the index back to an *actual* active ShardID from routingTable
-	// This simple modulo doesn't guarantee the target shard exists if shards were merged/split non-contiguously.
-	// For now, return the raw index as ShardID and rely on routingTable lookup later.
-	// A better approach maps hash ranges to specific ShardIDs.
-	targetID := ShardID(shardIndex)
-	// log.Printf("Determined raw shard index %d for data %x (ShardCount: %d)", targetID, data[:4], currentShardCount)
-
-	// Quick check if the target ID likely exists (doesn't guarantee it if merges happened)
-	sm.Mu.RLock()
-	_, exists := sm.RoutingTable[targetID]
-	sm.Mu.RUnlock()
-	if !exists {
-		// Fallback or re-routing needed. For now, just log and return the calculated ID.
-		// A simple fallback could be modulo len(sm.routingTable), but keys aren't sequential.
-		// Or just route to shard 0.
-		log.Printf("Warning: Determined shard %d does not exist in routing table. Routing may fail or fallback.", targetID)
-		// Fallback to shard 0 for now in this basic example
-		// return ShardID(0)
-	}
-
-	return targetID // Return the calculated ID, RouteTransaction must handle non-existence
-}
-
-// RouteTransaction sends a transaction to the appropriate shard's pool.
-func (sm *ShardManager) RouteTransaction(tx *Transaction) error {
-	// Determine target shard based on transaction content
-	shardID := sm.DetermineShard(tx.ID) // Uses updated DetermineShard
-
-	sm.Mu.RLock() // Lock for reading routing table
-	targetShard, ok := sm.RoutingTable[shardID]
-	
-	if !ok {
-		// If the target shard doesn't exist (e.g., due to merges), 
-		// use the first available shard as fallback
-		log.Printf("Routing Error: Target shard %d determined for Tx %x does not exist in routing table. Using fallback.", shardID, tx.ID)
-		
-		// Find any available shard (shard 0 preferably, but any if 0 doesn't exist)
-		targetShard = nil
-		
-		// Try shard 0 first
-		if shard0, exists := sm.RoutingTable[ShardID(0)]; exists {
-			targetShard = shard0
-			log.Printf("Routing Tx %x to fallback shard 0", tx.ID)
+		// Check for conflicts? Overwrite existing keys in A? For simplicity, overwrite.
+		putErr := shardA.StateDB.Put(key, value)
+		if putErr != nil {
+			log.Printf("Merge Migration Error: Failed to put key %x into target shard %d: %v", key, shardAID, putErr)
+			failedMigrationCount++
 		} else {
-			// If shard 0 doesn't exist, use the first available shard from the map
-			for id, shard := range sm.RoutingTable {
-				targetShard = shard
-				log.Printf("Routing Tx %x to fallback shard %d", tx.ID, id)
-				break
-			}
-		}
-		
-		if targetShard == nil {
-			sm.Mu.RUnlock() // Make sure to unlock before returning error
-			return fmt.Errorf("critical routing error: no shards available for tx %x", tx.ID)
+			migratedCount++
 		}
 	}
-	
-	// We've found the target shard. Now unlock before adding transaction
-	sm.Mu.RUnlock()
+	log.Printf("Merge Migration: Attempted to migrate %d keys from shard %d to %d. %d successful, %d failures.",
+		len(keysToMigrate), shardBID, shardAID, migratedCount, failedMigrationCount)
 
-	targetShard.AddTransaction(tx) // AddTransaction is internally locked
-	return nil
-}
-
-// GetShard retrieves a shard by its ID.
-func (sm *ShardManager) GetShard(id ShardID) (*Shard, bool) {
-	sm.Mu.RLock()
-	defer sm.Mu.RUnlock()
-	shard, ok := sm.Shards[id] // Check main map
-	return shard, ok
-}
-
-// --- Dynamic Sharding Implementation (Structural) ---
-
-// triggerSplitUnsafe performs the structural parts of splitting a shard.
-// Assumes sm.mu is already locked.
-func (sm *ShardManager) triggerSplitUnsafe(shardToSplitID ShardID) error {
-	if sm.ShardCount >= sm.Config.MaxShards {
-		return fmt.Errorf("cannot split shard %d: MaxShards (%d) reached", shardToSplitID, sm.Config.MaxShards)
+	if failedMigrationCount > 0 {
+		log.Printf("WARNING: Merge %d->%d completed with migration errors.", shardBID, shardAID)
+		// Proceeding anyway in PoC.
 	}
 
-	_, exists := sm.Shards[shardToSplitID]
-	if !exists {
-		return fmt.Errorf("cannot split non-existent shard %d", shardToSplitID)
+	// Clear state DB of the merged shard AFTER successful migration (or based on error handling policy)
+	// if failedMigrationCount == 0 { // Only clear if migration seemed ok? Or always try?
+	clearErr := shardB.StateDB.Clear()
+	if clearErr != nil {
+		log.Printf("Merge Warning: Failed to clear state DB for merged shard %d: %v", shardBID, clearErr)
 	}
+	// }
 
-	// 1. Determine and assign new ShardID
-	newShardID := sm.nextShardID
-	sm.nextShardID++ // Increment for the next split
+	// Update metrics for the target shard
+	shardA.Metrics.StateSize.Store(int64(shardA.StateDB.Size()))
+	log.Printf("Merge: Updated state size for target Shard %d: %d keys", shardAID, shardA.Metrics.StateSize.Load())
 
-	log.Printf("Initiating split of Shard %d into new Shard %d", shardToSplitID, newShardID)
+	// 2. Migrate Pending Transactions from B to A's Pool
+	log.Printf("Merge: Migrating %d pending transactions from Shard %d to Shard %d pool", len(shardB.TxPool), shardBID, shardAID)
+	shardA.TxPool = append(shardA.TxPool, shardB.TxPool...)
+	shardB.TxPool = []*Transaction{} // Clear B's pool
+	shardA.Metrics.PendingTxPool.Store(int64(len(shardA.TxPool)))
+	shardB.Metrics.PendingTxPool.Store(0)
 
-	// 2. Create new Shard instance
-	newShard := NewShard(newShardID)
+	// 3. Remove Shard B from the manager
+	//   a. Remove from consistent hash ring
+	shardBIDStr := fmt.Sprintf("%d", shardBID)
+	sm.consistent.Remove(shardBIDStr)
+	log.Printf("Merge: Removed %d from hash ring. Members: %v", shardBID, sm.consistent.Members())
 
-	// --- Placeholder: State Redistribution ---
-	// This is the complex part requiring careful state iteration, locking,
-	// potential temporary suspension of operations on the original shard,
-	// and cryptographic commitments.
-	log.Printf("Placeholder: Redistributing state from Shard %d to Shard %d...", shardToSplitID, newShardID)
-	// Example: Iterate originalShard.State, decide which keys go to newShard.State, move them.
-	// err := migrateState(originalShard, newShard)
-	// if err != nil { return fmt.Errorf("state migration failed: %w", err) }
-	log.Printf("Placeholder: State redistribution logic not implemented.")
-	// --- End Placeholder ---
-
-	// 4. Update Merkle roots/accumulators (Placeholder)
-	// After state migration, the state roots/accumulators for both shards need recalculation.
-	log.Printf("Placeholder: Updating state roots/accumulators for shards %d and %d.", shardToSplitID, newShardID)
-
-	// 5. Update ShardManager maps and count
-	sm.Shards[newShardID] = newShard
-	sm.RoutingTable[newShardID] = newShard // Add new shard to routing
-	sm.ShardCount++
-
-	log.Printf("Shard split complete (structurally). Shard count: %d. Shard %d added.", sm.ShardCount, newShardID)
-
-	// 6. Consensus (Placeholder)
-	log.Printf("Placeholder: Consensus required to finalize shard split (%d -> %d).", shardToSplitID, newShardID)
-
-	return nil
-}
-
-// triggerMergeUnsafe performs the structural parts of merging two shards.
-// Assumes sm.mu is already locked.
-func (sm *ShardManager) triggerMergeUnsafe(shardID1, shardID2 ShardID) error {
-	if sm.ShardCount <= sm.Config.MinShards {
-		return fmt.Errorf("cannot merge shards %d, %d: MinShards (%d) reached", shardID1, shardID2, sm.Config.MinShards)
+	//   b. Remove from shardIDs slice
+	newShardIDs := make([]uint64, 0, len(sm.shardIDs)-1)
+	for _, id := range sm.shardIDs {
+		if id != shardBID {
+			newShardIDs = append(newShardIDs, id)
+		}
 	}
-	if shardID1 == shardID2 {
-		return fmt.Errorf("cannot merge a shard with itself (%d)", shardID1)
-	}
+	sm.shardIDs = newShardIDs
+	// No need to re-sort as relative order is maintained
 
-	_, exists1 := sm.Shards[shardID1]
-	shard2, exists2 := sm.Shards[shardID2]
+	//   c. Remove from shards map
+	delete(sm.shards, shardBID)
 
-	if !exists1 || !exists2 {
-		return fmt.Errorf("cannot merge non-existent shards (%d exists: %t, %d exists: %t)", shardID1, exists1, shardID2, exists2)
-	}
+	//   d. Stop the merged shard's goroutines/processing (if it has any active ones)
+	shardB.Stop()
 
-	// Convention: Merge shard2 *into* shard1. Shard2 will be removed.
-	log.Printf("Initiating merge of Shard %d into Shard %d", shardID2, shardID1)
+	log.Printf("--- Merge Complete: Shard %d merged into Shard %d --- New Shard IDs: %v", shardBID, shardAID, sm.shardIDs)
 
-	// --- Placeholder: State Migration ---
-	// Stop processing on shard2, migrate its state to shard1, handle conflicts.
-	shard2.Stop() // Signal shard 2 to stop activity
-	log.Printf("Placeholder: Migrating state from Shard %d to Shard %d...", shardID2, shardID1)
-	// Example: Iterate shard2.State, add keys/values to shard1.State, resolve conflicts.
-	// err := consolidateState(shard1, shard2)
-	// if err != nil { return fmt.Errorf("state consolidation failed: %w", err) }
-	log.Printf("Placeholder: State migration logic not implemented.")
-	// --- End Placeholder ---
+	// TODO: Notify system about shard removal.
 
-	// 3. Update Merkle roots/accumulators (Placeholder)
-	log.Printf("Placeholder: Updating state root/accumulator for shard %d after merge.", shardID1)
-
-	// 4. Remove shard2 from manager
-	delete(sm.Shards, shardID2)
-	delete(sm.RoutingTable, shardID2) // Remove from routing
-	sm.ShardCount--
-
-	log.Printf("Shard merge complete (structurally). Shard count: %d. Shard %d removed.", sm.ShardCount, shardID2)
-
-	// 7. Consensus (Placeholder)
-	log.Printf("Placeholder: Consensus required to finalize shard merge (%d into %d).", shardID2, shardID1)
-
-	return nil
-}
-
-// --- Cross-Shard Communication (Placeholders - Unchanged) ---
-
-type CrossShardReceipt struct {
-	OriginShard      ShardID
-	DestinationShard ShardID
-	TransactionID    []byte
-	// Include necessary state proofs or commitments
-}
-
-func (s *Shard) ProcessCrossShardReceipt(receipt *CrossShardReceipt) error {
-	s.Mu.Lock()
-	defer s.Mu.Unlock()
-	if receipt.DestinationShard != s.ID {
-		return errors.New("receipt destined for wrong shard")
-	}
-	log.Printf("Shard %d: Processing cross-shard receipt for Tx %x from Shard %d\n",
-		s.ID, receipt.TransactionID, receipt.OriginShard)
-	log.Printf("Placeholder: Cross-shard receipt processing logic not fully implemented.\n")
 	return nil
 }

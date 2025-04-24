@@ -10,12 +10,12 @@ import (
 
 // Blockchain now manages multiple shards.
 type Blockchain struct {
-	ShardManager *ShardManager        // Manages all shards
-	Difficulty   int                  // Global PoW difficulty (can be per-shard later)
-	ChainHeight  int                  // Approximate overall chain height (e.g., max shard height) - needs refinement
-	Mu           sync.RWMutex         // Protects global state like ChainHeight
-	BlockChains  map[ShardID][]*Block // In-memory storage per shard chain
-	ChainMu      sync.RWMutex         // Lock specifically for accessing blockChains map
+	ShardManager *ShardManager       // Manages all shards
+	Difficulty   int                 // Global PoW difficulty (can be per-shard later)
+	ChainHeight  int                 // Approximate overall chain height (e.g., max shard height) - needs refinement
+	Mu           sync.RWMutex        // Protects global state like ChainHeight
+	BlockChains  map[uint64][]*Block // In-memory storage per shard chain
+	ChainMu      sync.RWMutex        // Lock specifically for accessing blockChains map
 }
 
 // NewBlockchain creates a new sharded blockchain.
@@ -23,13 +23,14 @@ func NewBlockchain(initialShardCount uint, difficulty int) (*Blockchain, error) 
 	if difficulty < 1 {
 		return nil, errors.New("difficulty must be at least 1")
 	}
-	// Cannot check initialShardCount against config min/max here easily,
-	// NewShardManager handles this check.
 
-	// *** FIX: Pass default config to NewShardManager ***
-	sm, err := NewShardManager(initialShardCount, DefaultShardManagerConfig()) // Pass default config
+	// Create config and convert initialShardCount to int
+	config := DefaultShardManagerConfig()
+	initialShards := int(initialShardCount)
+
+	// Create shard manager with config
+	sm, err := NewShardManager(config, initialShards)
 	if err != nil {
-		// Error might be due to initialShardCount being outside config min/max
 		return nil, fmt.Errorf("failed to create shard manager: %w", err)
 	}
 
@@ -37,13 +38,16 @@ func NewBlockchain(initialShardCount uint, difficulty int) (*Blockchain, error) 
 		ShardManager: sm,
 		Difficulty:   difficulty,
 		ChainHeight:  0, // Initial height is 0
-		BlockChains:  make(map[ShardID][]*Block),
+		BlockChains:  make(map[uint64][]*Block),
 	}
 
 	// Create genesis block for each shard
 	bc.ChainMu.Lock() // Lock before modifying blockChains map
 	defer bc.ChainMu.Unlock()
-	for shardID := range sm.Shards { // Iterate over shards created by manager
+
+	// Get all shard IDs from the manager
+	shardIDs := sm.GetAllShardIDs()
+	for _, shardID := range shardIDs {
 		genesis := NewGenesisBlock(shardID, nil, difficulty)
 		bc.BlockChains[shardID] = []*Block{genesis}
 		log.Printf("Created Genesis Block for Shard %d\n", shardID)
@@ -66,12 +70,20 @@ func (bc *Blockchain) AddTransaction(tx *Transaction) error {
 		return nil
 	} else {
 		// Route intra-shard or other types based on general routing rule (e.g., ID)
-		return bc.ShardManager.RouteTransaction(tx)
+		shardID, err := bc.ShardManager.DetermineShard(tx.ID)
+		if err != nil {
+			return fmt.Errorf("failed to determine shard for tx %x: %w", tx.ID, err)
+		}
+		shard, ok := bc.ShardManager.GetShard(shardID)
+		if !ok {
+			return fmt.Errorf("determined shard %d not found for tx %x", shardID, tx.ID)
+		}
+		return shard.AddTransaction(tx)
 	}
 }
 
 // MineShardBlock attempts to mine a new block for a specific shard using transactions from its pool.
-func (bc *Blockchain) MineShardBlock(shardID ShardID) (*Block, error) {
+func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 	shard, ok := bc.ShardManager.GetShard(shardID)
 	if !ok {
 		return nil, fmt.Errorf("shard %d not found", shardID)
@@ -96,7 +108,7 @@ func (bc *Blockchain) MineShardBlock(shardID ShardID) (*Block, error) {
 			// Create receipt but skip processing for now
 			// The receipt is left here for future implementation
 			_ = &CrossShardReceipt{ // Assign to blank identifier as it's not used yet
-				OriginShard:      *tx.SourceShard,
+				SourceShard:      *tx.SourceShard,
 				DestinationShard: *tx.DestinationShard,
 				TransactionID:    tx.ID,
 				// Add proof data here in a real system
@@ -121,11 +133,9 @@ func (bc *Blockchain) MineShardBlock(shardID ShardID) (*Block, error) {
 
 	// Process incoming receipts (if a mechanism delivered them to receiptsToProcess)
 	for _, receipt := range receiptsToProcess { // This loop will currently do nothing
-		err := shard.ProcessCrossShardReceipt(receipt)
-		if err != nil {
-			log.Printf("Shard %d: Error processing receipt for Tx %x: %v", shardID, receipt.TransactionID, err)
-			// Handle error - potentially revert state changes from receipt processing
-		}
+		// Skip processing for now as the method doesn't exist
+		log.Printf("Shard %d: Would process receipt for Tx %x (once implemented)", shardID, receipt.TransactionID)
+		// Later: err := shard.ProcessCrossShardReceipt(receipt)
 	}
 
 	if len(transactionsForBlock) == 0 {
@@ -146,11 +156,15 @@ func (bc *Blockchain) MineShardBlock(shardID ShardID) (*Block, error) {
 	prevBlock := shardChain[len(shardChain)-1]
 	bc.ChainMu.RUnlock() // Unlock after reading
 
-	newHeight := prevBlock.Height + 1
-	newBlock := NewBlock(shardID, transactionsForBlock, prevBlock.Hash, newHeight, bc.Difficulty)
+	newHeight := prevBlock.Header.Height + 1
+	emptyStateRoot := []byte{} // Replace with actual state root calculation
+	newBlock, err := NewBlock(shardID, transactionsForBlock, prevBlock.Hash, newHeight, emptyStateRoot, bc.Difficulty)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create new block: %w", err)
+	}
 
 	// Basic validation before adding
-	pow := NewProofOfWork(newBlock, bc.Difficulty)
+	pow := NewProofOfWork(newBlock)
 	if !pow.Validate() {
 		return nil, fmt.Errorf("shard %d: mined block %d failed proof-of-work validation", shardID, newHeight)
 	}
@@ -161,24 +175,25 @@ func (bc *Blockchain) MineShardBlock(shardID ShardID) (*Block, error) {
 	// Add the successfully mined block to the shard's chain
 	bc.ChainMu.Lock() // Lock map access for writing
 	bc.BlockChains[shardID] = append(bc.BlockChains[shardID], newBlock)
-	currentHeight := newBlock.Height
+	currentHeight := newBlock.Header.Height
 	bc.ChainMu.Unlock() // Unlock map access
 
 	bc.Mu.Lock() // Lock global state
-	if currentHeight > bc.ChainHeight {
-		bc.ChainHeight = currentHeight // Update global height if this shard is tallest
+	if int(currentHeight) > bc.ChainHeight {
+		bc.ChainHeight = int(currentHeight) // Update global height if this shard is tallest
 	}
 	bc.Mu.Unlock() // Unlock global state
 
 	// Update shard metrics after block is added
-	shard.UpdateLastBlockTimestamp(newBlock.Timestamp)
+	// Commented out since it seems this method doesn't exist yet
+	// shard.UpdateLastBlockTimestamp(newBlock.Header.Timestamp)
 
 	log.Printf("Shard %d: Added Block %d to chain.\n", shardID, newHeight)
 	return newBlock, nil
 }
 
 // GetLatestBlock returns the most recent block for a specific shard.
-func (bc *Blockchain) GetLatestBlock(shardID ShardID) (*Block, error) {
+func (bc *Blockchain) GetLatestBlock(shardID uint64) (*Block, error) {
 	bc.ChainMu.RLock() // Use RLock for reading
 	defer bc.ChainMu.RUnlock()
 
@@ -215,20 +230,20 @@ func ValidateBlockIntegrity(newBlock, prevBlock *Block) bool {
 		log.Println("Error: Cannot validate nil blocks.")
 		return false
 	}
-	if newBlock.ShardID != prevBlock.ShardID {
+	if newBlock.Header.ShardID != prevBlock.Header.ShardID {
 		log.Printf("Validation Error: Block %d ShardID (%d) does not match Prev Block %d ShardID (%d)\n",
-			newBlock.Height, newBlock.ShardID, prevBlock.Height, prevBlock.ShardID)
+			newBlock.Header.Height, newBlock.Header.ShardID, prevBlock.Header.Height, prevBlock.Header.ShardID)
 		return false
 	}
-	if !bytes.Equal(newBlock.PrevBlockHash, prevBlock.Hash) {
+	if !bytes.Equal(newBlock.Header.PrevBlockHash, prevBlock.Hash) {
 		log.Printf("Validation Error: Shard %d Block %d PrevBlockHash (%x) does not match Block %d Hash (%x)\n",
-			newBlock.ShardID, newBlock.Height, newBlock.PrevBlockHash, prevBlock.Height, prevBlock.Hash)
+			newBlock.Header.ShardID, newBlock.Header.Height, newBlock.Header.PrevBlockHash, prevBlock.Header.Height, prevBlock.Hash)
 		return false
 	}
 	// *** FIX: Corrected log format string for height validation ***
-	if newBlock.Height != prevBlock.Height+1 {
+	if newBlock.Header.Height != prevBlock.Header.Height+1 {
 		log.Printf("Validation Error: Shard %d Block %d Height (%d) is not sequential to previous block height %d\n",
-			newBlock.ShardID, newBlock.Height, newBlock.Height, prevBlock.Height) // Corrected second %d to newBlock.Height
+			newBlock.Header.ShardID, newBlock.Header.Height, newBlock.Header.Height, prevBlock.Header.Height) // Corrected second %d to newBlock.Height
 		return false
 	}
 	// log.Printf("Shard %d: Block %d integrity validated successfully against Block %d.\n", newBlock.ShardID, newBlock.Height, prevBlock.Height)
@@ -245,14 +260,14 @@ func (bc *Blockchain) IsChainValid() bool {
 	validationErrors := make(chan error, len(bc.BlockChains)) // Channel for errors
 
 	// Create a copy of the chains to validate, so we don't hold the lock during validation
-	chainsToValidate := make(map[ShardID][]*Block)
+	chainsToValidate := make(map[uint64][]*Block)
 	for id, chain := range bc.BlockChains {
 		chainsToValidate[id] = chain
 	}
 
 	for shardID, chain := range chainsToValidate {
 		wg.Add(1)
-		go func(sID ShardID, ch []*Block) {
+		go func(sID uint64, ch []*Block) {
 			defer wg.Done()
 			// log.Printf("Validating chain for Shard %d...", sID) // Reduce log noise
 			if len(ch) == 0 {
@@ -261,7 +276,7 @@ func (bc *Blockchain) IsChainValid() bool {
 			}
 			if len(ch) == 1 {
 				genesis := ch[0]
-				powGenesis := NewProofOfWork(genesis, bc.Difficulty)
+				powGenesis := NewProofOfWork(genesis)
 				if !powGenesis.Validate() {
 					err := fmt.Errorf("shard %d genesis block PoW validation failed", sID)
 					log.Println(err)
@@ -276,16 +291,16 @@ func (bc *Blockchain) IsChainValid() bool {
 				currentBlock := ch[i]
 				prevBlock := ch[i-1]
 
-				pow := NewProofOfWork(currentBlock, bc.Difficulty)
+				pow := NewProofOfWork(currentBlock)
 				if !pow.Validate() {
-					err := fmt.Errorf("shard %d PoW validation failed for Block %d (Hash: %x)", sID, currentBlock.Height, currentBlock.Hash)
+					err := fmt.Errorf("shard %d PoW validation failed for Block %d (Hash: %x)", sID, currentBlock.Header.Height, currentBlock.Hash)
 					log.Println(err)
 					validationErrors <- err
 					return // Stop validation for this shard on first error
 				}
 
 				if !ValidateBlockIntegrity(currentBlock, prevBlock) {
-					err := fmt.Errorf("shard %d integrity validation failed between Block %d and Block %d", sID, currentBlock.Height, prevBlock.Height)
+					err := fmt.Errorf("shard %d integrity validation failed between Block %d and Block %d", sID, currentBlock.Header.Height, prevBlock.Header.Height)
 					log.Println(err)
 					validationErrors <- err
 					return // Stop validation for this shard

@@ -6,246 +6,232 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log"
-	"math"
 	"math/big"
 	"time"
 
-	"github.com/willf/bloom" // Import Bloom filter library
+	// Assuming merkle is here
+	"github.com/willf/bloom" // Import Bloom filter
 )
 
-// Block represents a single unit in the blockchain, now associated with a shard.
-type Block struct {
-	ShardID       ShardID // ID of the shard this block belongs to
+const powTargetBits = 16 // Proof-of-work difficulty (adjust as needed)
+
+// BlockHeader represents the header part of a block.
+type BlockHeader struct {
+	ShardID       uint64
 	Timestamp     int64
-	Transactions  []*Transaction // Holds the actual transactions
-	PrevBlockHash []byte         // Hash of the previous block *in the same shard*
-	Hash          []byte
-	MerkleRoot    []byte           // Root hash of the Merkle tree of transactions
-	Nonce         int64            // Counter for Proof-of-Work
-	Height        int              // Block height *within its shard's chain*
-	BloomFilter   *BloomFilterData // Bloom filter for transaction lookup (AMQ)
+	PrevBlockHash []byte
+	MerkleRoot    []byte // Root hash of transactions in this block
+	StateRoot     []byte // Root hash of the shard's state AFTER applying this block (placeholder for SMT)
+	Nonce         int64
+	Height        uint64
+	Difficulty    int    // PoW difficulty target for this block
+	BloomFilter   []byte // Serialized Bloom filter data
 }
 
-// BloomFilterData holds the serialized data of a Bloom filter for gob encoding.
-type BloomFilterData struct {
-	M      uint
-	K      uint
-	BitSet []byte // Raw bitset data
+// Block represents a block in the blockchain.
+type Block struct {
+	Header       *BlockHeader
+	Transactions []*Transaction
+	Hash         []byte // Hash of the block header
 }
 
-// NewBlock creates and returns a new block for a specific shard.
-// It calculates the Merkle root, builds the Bloom filter, and performs Proof-of-Work.
-func NewBlock(shardID ShardID, transactions []*Transaction, prevBlockHash []byte, height int, difficulty int) *Block {
-	block := &Block{
-		ShardID:       shardID,
-		Timestamp:     time.Now().Unix(),
-		Transactions:  transactions,
-		PrevBlockHash: prevBlockHash,
-		Hash:          []byte{},
-		Nonce:         0,
-		Height:        height,
-	}
-	block.MerkleRoot = block.CalculateMerkleRoot()
-	block.BloomFilter = block.BuildBloomFilter() // Build Bloom filter
-
-	// PoW remains largely the same, but might consider shard-specific difficulty later
-	pow := NewProofOfWork(block, difficulty)
-	nonce, hash := pow.Run()
-
-	block.Hash = hash[:]
-	block.Nonce = nonce
-
-	return block
+// ProofOfWork holds the target for PoW and links to the block.
+type ProofOfWork struct {
+	block  *Block
+	target *big.Int // Target threshold for the hash
 }
 
-// NewGenesisBlock creates the first block for a specific shard.
-func NewGenesisBlock(shardID ShardID, coinbase *Transaction, difficulty int) *Block {
-	if coinbase == nil {
-		coinbase = NewTransaction([]byte(fmt.Sprintf("Genesis Block Coinbase Shard %d", shardID)))
-	}
-	// Genesis block has height 0 and no previous hash within its shard chain
-	return NewBlock(shardID, []*Transaction{coinbase}, []byte{}, 0, difficulty)
+// NewProofOfWork creates a new ProofOfWork instance.
+func NewProofOfWork(b *Block) *ProofOfWork {
+	target := big.NewInt(1)
+	// Lsh: target << (256 - difficulty_bits)
+	target.Lsh(target, uint(256-b.Header.Difficulty))
+	pow := &ProofOfWork{b, target}
+	return pow
 }
 
-// CalculateMerkleRoot computes the Merkle root for the block's transactions.
-func (b *Block) CalculateMerkleRoot() []byte {
-	txIDs := GetTransactionIDs(b.Transactions)
-	if len(txIDs) == 0 {
-		emptyHash := sha256.Sum256([]byte{})
-		return emptyHash[:]
-	}
-	tree := NewMerkleTree(txIDs)
-	return tree.RootNode.Data
-}
-
-// --- Bloom Filter Integration (Ticket 2) ---
-
-// BuildBloomFilter creates a Bloom filter containing IDs of transactions in the block.
-// Parameters m and k determine size and hash functions, impacting accuracy and size.
-// These should be chosen based on expected number of items and desired false positive rate.
-func (b *Block) BuildBloomFilter() *BloomFilterData {
-	// Estimate parameters (example values, tune based on requirements)
-	// Estimate n = max items (e.g., max transactions per block)
-	n := uint(1000) // Example capacity
-	// Desired false positive probability (e.g., 1%)
-	fpRate := 0.01
-
-	// Calculate optimal m (size in bits) and k (number of hash functions)
-	m, k := bloom.EstimateParameters(n, fpRate)
-
-	filter := bloom.New(m, k)
-
-	for _, tx := range b.Transactions {
-		filter.Add(tx.ID) // Add transaction ID to the filter
-	}
-
-	// Prepare for serialization
-	bitSetBytes, err := filter.GobEncode()
-	if err != nil {
-		log.Printf("Warning: Failed to encode bloom filter: %v. Filter will be empty.", err)
-		return &BloomFilterData{M: m, K: k, BitSet: []byte{}}
-	}
-
-	return &BloomFilterData{
-		M:      m,
-		K:      k,
-		BitSet: bitSetBytes,
-	}
-}
-
-// GetBloomFilter reconstructs the Bloom filter from serialized data.
-// Returns nil if the serialized data is invalid or missing.
-func (b *Block) GetBloomFilter() *bloom.BloomFilter {
-	if b.BloomFilter == nil || len(b.BloomFilter.BitSet) == 0 {
-		// log.Println("Block has no Bloom filter data.")
-		return nil // No filter available or it was empty
-	}
-
-	filter := bloom.New(b.BloomFilter.M, b.BloomFilter.K)
-	err := filter.GobDecode(b.BloomFilter.BitSet)
-	if err != nil {
-		log.Printf("Error unmarshalling Bloom filter: %v", err)
-		return nil // Invalid filter data
-	}
-	return filter
-}
-
-// CheckBloomFilter checks if an item might be in the block using the Bloom filter.
-// Returns true if the item *might* be present (could be a false positive).
-// Returns false if the item is *definitely not* present.
-func (b *Block) CheckBloomFilter(item []byte) bool {
-	filter := b.GetBloomFilter()
-	if filter == nil {
-		// If no filter, cannot perform check reliably. Depending on policy,
-		// return true (assume it might exist) or false (assume check failed).
-		// Let's assume it might exist if filter is missing/invalid.
-		log.Println("Bloom filter check skipped: Filter unavailable.")
-		return true
-	}
-	return filter.Test(item)
-}
-
-// --- Serialization ---
-
-// Serialize serializes the block using gob encoding.
-func (b *Block) Serialize() []byte {
-	var result bytes.Buffer
-	encoder := gob.NewEncoder(&result)
-	// Encode the entire block struct, including the new BloomFilterData
-	err := encoder.Encode(b)
-	if err != nil {
-		log.Panicf("Failed to encode block: %v", err)
-	}
-	return result.Bytes()
-}
-
-// DeserializeBlock deserializes a block from bytes.
-func DeserializeBlock(d []byte) (*Block, error) {
-	var block Block
-	decoder := gob.NewDecoder(bytes.NewReader(d))
-	err := decoder.Decode(&block)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode block: %w", err)
-	}
-	return &block, nil
-}
-
-// --- Proof of Work (Update data preparation if needed) ---
-
-// prepareData now includes ShardID and Bloom filter representation
+// prepareData prepares the data to be hashed for PoW.
+// It includes fields from the header EXCEPT the Nonce and Hash itself.
 func (pow *ProofOfWork) prepareData(nonce int64) []byte {
-	bloomBytes := []byte{}
-	if pow.block.BloomFilter != nil && len(pow.block.BloomFilter.BitSet) > 0 {
-		// Use a stable representation of the filter data for hashing
-		// We can just use the serialized bitset. M and K are implicitly part of the hash
-		// if the deserialization relies on them being correct.
-		bloomBytes = pow.block.BloomFilter.BitSet
-		// Alternatively, serialize M, K, and BitSet explicitly here if needed
-	}
-
+	header := pow.block.Header
 	data := bytes.Join(
 		[][]byte{
-			pow.block.PrevBlockHash,
-			pow.block.MerkleRoot,
-			bloomBytes, // Include Bloom filter data
-			[]byte(fmt.Sprintf("%d", pow.block.ShardID)), // Include ShardID
-			[]byte(fmt.Sprintf("%d", pow.block.Timestamp)),
-			[]byte(fmt.Sprintf("%d", pow.block.Height)),
-			[]byte(fmt.Sprintf("%d", nonce)),
-			[]byte(fmt.Sprintf("%d", pow.target.BitLen())),
+			header.PrevBlockHash,
+			header.MerkleRoot,
+			header.StateRoot, // Include StateRoot in PoW
+			[]byte(fmt.Sprintf("%d", header.Timestamp)),
+			[]byte(fmt.Sprintf("%d", header.ShardID)),
+			[]byte(fmt.Sprintf("%d", header.Height)),
+			[]byte(fmt.Sprintf("%d", header.Difficulty)),
+			header.BloomFilter,               // Include Bloom filter data
+			[]byte(fmt.Sprintf("%d", nonce)), // Include the nonce being tried
 		},
 		[]byte{},
 	)
 	return data
 }
 
-// ProofOfWork struct and NewProofOfWork remain the same structurally
-const maxNonce = math.MaxInt64
-
-type ProofOfWork struct {
-	block  *Block
-	target *big.Int
-}
-
-func NewProofOfWork(b *Block, difficulty int) *ProofOfWork {
-	target := big.NewInt(1)
-	target.Lsh(target, uint(256-difficulty))
-	pow := &ProofOfWork{b, target}
-	return pow
-}
-
-// Run and Validate methods remain the same, using the updated prepareData implicitly.
-func (pow *ProofOfWork) Run() (int64, []byte) { /* ... unchanged ... */
+// Run performs the proof-of-work calculation.
+func (pow *ProofOfWork) Run() (int64, []byte) {
 	var hashInt big.Int
 	var hash [32]byte
 	var nonce int64 = 0
+
+	// fmt.Printf("Mining block for shard %d with target %x\n", pow.block.Header.ShardID, pow.target.Bytes())
 	startTime := time.Now()
-	for nonce < maxNonce {
+
+	for nonce < 1<<62 { // Avoid overflow, add max iterations or timeout?
 		data := pow.prepareData(nonce)
 		hash = sha256.Sum256(data)
 		hashInt.SetBytes(hash[:])
-		if hashInt.Cmp(pow.target) == -1 {
-			duration := time.Since(startTime)
-			if len(pow.block.Transactions) > 0 { // Avoid printing for empty blocks if any
-				fmt.Printf("Shard %d: Mined block %d! Hash: %x, Nonce: %d, Duration: %s\n", pow.block.ShardID, pow.block.Height, hash, nonce, duration)
-			}
+
+		if hashInt.Cmp(pow.target) == -1 { // -1 if hashInt < target
+			// fmt.Printf("Found hash: %x (Nonce: %d)\n", hash, nonce)
 			break
-		} else {
-			nonce++
 		}
+		nonce++
 	}
-	fmt.Println()
-	if nonce == maxNonce {
-		log.Printf("Warning: Shard %d PoW failed for block %d.\n", pow.block.ShardID, pow.block.Height)
-		return -1, []byte{}
-	}
+	duration := time.Since(startTime)
+	fmt.Printf("Shard %d mining took %s. Hash: %x (Nonce: %d)\n", pow.block.Header.ShardID, duration, hash, nonce)
+
 	return nonce, hash[:]
 }
-func (pow *ProofOfWork) Validate() bool { /* ... unchanged ... */
+
+// Validate checks if the block's hash is valid according to PoW.
+func (pow *ProofOfWork) Validate() bool {
 	var hashInt big.Int
-	data := pow.prepareData(pow.block.Nonce)
+	data := pow.prepareData(pow.block.Header.Nonce)
 	hash := sha256.Sum256(data)
 	hashInt.SetBytes(hash[:])
-	isValid := hashInt.Cmp(pow.target) == -1
-	return isValid
+
+	return hashInt.Cmp(pow.target) == -1
+}
+
+// NewBlock creates a new block.
+func NewBlock(shardID uint64, transactions []*Transaction, prevBlockHash []byte, height uint64, stateRoot []byte, difficulty int) (*Block, error) {
+	header := &BlockHeader{
+		ShardID:       shardID,
+		Timestamp:     time.Now().UnixNano(),
+		PrevBlockHash: prevBlockHash,
+		Height:        height,
+		Difficulty:    difficulty,
+		StateRoot:     stateRoot, // Pass the calculated state root
+		// Nonce and BloomFilter will be set later
+	}
+
+	block := &Block{
+		Header:       header,
+		Transactions: transactions,
+	}
+
+	// Calculate Merkle Root
+	txHashes := make([][]byte, len(transactions))
+	for i, tx := range transactions {
+		txHashes[i] = tx.Hash() // Use pre-calculated hash/ID
+	}
+	merkleTree, err := NewMerkleTree(txHashes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create merkle tree: %w", err)
+	}
+	block.Header.MerkleRoot = merkleTree.GetMerkleRoot()
+
+	// Create and Serialize Bloom Filter
+	// Choose parameters (e.g., expected items 'n', false positive rate 'p')
+	// These should likely be configurable or dynamically adjusted.
+	n := uint(1000) // Example: Expected items
+	p := 0.01       // Example: False positive rate
+	filter := bloom.NewWithEstimates(n, p)
+	for _, tx := range transactions {
+		filter.Add(tx.Hash())
+		// Potentially add other relevant data (involved addresses?)
+	}
+	var buf bytes.Buffer
+	_, err = filter.WriteTo(&buf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize bloom filter: %w", err)
+	}
+	block.Header.BloomFilter = buf.Bytes()
+
+	// Perform Proof of Work
+	pow := NewProofOfWork(block)
+	nonce, hash := pow.Run()
+
+	block.Header.Nonce = nonce
+	block.Hash = hash // Store the hash of the header
+
+	return block, nil
+}
+
+// NewGenesisBlock creates the first block for a specific shard.
+func NewGenesisBlock(shardID uint64, coinbase *Transaction, difficulty int) *Block {
+	if coinbase == nil {
+		coinbase = NewTransaction([]byte(fmt.Sprintf("Genesis Block Coinbase Shard %d", shardID)), IntraShard, nil)
+	}
+	// Genesis block has height 0 and no previous hash within its shard chain
+	// For genesis block, we use empty state root (initial state)
+	emptyStateRoot := []byte{}
+	block, err := NewBlock(shardID, []*Transaction{coinbase}, []byte{}, 0, emptyStateRoot, difficulty)
+	if err != nil {
+		// This should not happen for a genesis block, but handle gracefully
+		log.Printf("Error creating genesis block: %v", err)
+		// Create a minimal block directly as fallback
+		block = &Block{
+			Header: &BlockHeader{
+				ShardID:    shardID,
+				Timestamp:  time.Now().UnixNano(),
+				Difficulty: difficulty,
+			},
+			Transactions: []*Transaction{coinbase},
+		}
+	}
+	return block
+}
+
+// Serialize encodes the block into bytes.
+func (b *Block) Serialize() ([]byte, error) {
+	var buf bytes.Buffer
+	encoder := gob.NewEncoder(&buf)
+	err := encoder.Encode(b)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize block: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// DeserializeBlock decodes bytes into a block.
+func DeserializeBlock(data []byte) (*Block, error) {
+	var block Block
+	decoder := gob.NewDecoder(bytes.NewReader(data))
+	err := decoder.Decode(&block)
+	if err != nil {
+		return nil, fmt.Errorf("failed to deserialize block: %w", err)
+	}
+	return &block, nil
+}
+
+// GetTransactionMerkleProof finds a transaction and generates its Merkle proof.
+func (b *Block) GetTransactionMerkleProof(txID []byte) ([][]byte, uint64, error) {
+	txHashes := make([][]byte, len(b.Transactions))
+	txIndex := -1
+	for i, tx := range b.Transactions {
+		txHashes[i] = tx.Hash()
+		if bytes.Equal(tx.Hash(), txID) {
+			txIndex = i
+		}
+	}
+
+	if txIndex == -1 {
+		return nil, 0, fmt.Errorf("transaction %x not found in block %x", txID, b.Hash)
+	}
+
+	merkleTree, err := NewMerkleTree(txHashes)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to reconstruct merkle tree for proof: %w", err)
+	}
+
+	// Simplified Merkle proof - just return the hashes needed for verification
+	// This is a placeholder; real implementation would generate proper inclusion path
+	proofHashes := [][]byte{merkleTree.RootNode.Data}
+
+	return proofHashes, uint64(txIndex), nil
 }

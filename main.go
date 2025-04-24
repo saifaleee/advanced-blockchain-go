@@ -29,11 +29,11 @@ func main() {
 	for i := 0; i < numTx; i++ {
 		// Introduce some cross-shard transactions randomly
 		if rand.Intn(5) == 0 && numShards > 1 { // ~20% chance if multiple shards exist
-			source := core.ShardID(rand.Intn(int(numShards)))
-			dest := core.ShardID(rand.Intn(int(numShards)))
+			source := uint64(rand.Intn(int(numShards)))
+			dest := uint64(rand.Intn(int(numShards)))
 			// Ensure source != dest for a meaningful cross-shard tx
 			for dest == source {
-				dest = core.ShardID(rand.Intn(int(numShards)))
+				dest = uint64(rand.Intn(int(numShards)))
 			}
 			txs[i] = core.NewCrossShardInitTransaction(
 				[]byte(fmt.Sprintf("Cross-Shard Data %d (S%d->S%d)", i, source, dest)),
@@ -42,7 +42,7 @@ func main() {
 			)
 			log.Printf("Created Cross-Shard Tx %x (Shard %d -> Shard %d)", txs[i].ID, source, dest)
 		} else {
-			txs[i] = core.NewTransaction([]byte(fmt.Sprintf("Regular Transaction Data %d", i)))
+			txs[i] = core.NewTransaction([]byte(fmt.Sprintf("Regular Transaction Data %d", i)), core.IntraShard, nil)
 			log.Printf("Created Intra-Shard Tx %x", txs[i].ID)
 		}
 
@@ -62,7 +62,7 @@ func main() {
 		log.Printf("\n--- Mining Round %d ---", round+1)
 		for i := uint(0); i < numShards; i++ {
 			wg.Add(1)
-			go func(shardID core.ShardID) {
+			go func(shardID uint64) {
 				defer wg.Done()
 				log.Printf("Starting mining for Shard %d...", shardID)
 				_, err := bc.MineShardBlock(shardID)
@@ -74,7 +74,7 @@ func main() {
 						log.Printf("Shard %d: Mining skipped/empty block (%v)", shardID, err)
 					}
 				}
-			}(core.ShardID(i))
+			}(uint64(i))
 		}
 		wg.Wait() // Wait for all shards in this round to finish mining attempt
 		log.Printf("--- Mining Round %d Complete ---", round+1)
@@ -87,25 +87,19 @@ func main() {
 	for shardID, chain := range bc.BlockChains {
 		fmt.Printf("\n======= Shard %d =======\n", shardID)
 		for _, block := range chain {
-			fmt.Printf("--- Block %d ---\n", block.Height)
-			fmt.Printf("Timestamp:      %d\n", block.Timestamp)
-			fmt.Printf("Previous Hash:  %x\n", block.PrevBlockHash)
-			fmt.Printf("Merkle Root:    %x\n", block.MerkleRoot)
-			// Display Bloom Filter Info (Optional)
-			if block.BloomFilter != nil {
-				bf := block.GetBloomFilter()
-				bfInfo := "N/A"
-				if bf != nil {
-					// The willf/bloom library doesn't have EstimateOccupancy, so just show M and K
-					bfInfo = fmt.Sprintf("M=%d, K=%d", block.BloomFilter.M, block.BloomFilter.K)
-				}
-				fmt.Printf("Bloom Filter:   %s\n", bfInfo)
+			fmt.Printf("--- Block %d ---\n", block.Header.Height)
+			fmt.Printf("Timestamp:      %d\n", block.Header.Timestamp)
+			fmt.Printf("Previous Hash:  %x\n", block.Header.PrevBlockHash)
+			fmt.Printf("Merkle Root:    %x\n", block.Header.MerkleRoot)
+			// Display Bloom Filter Info
+			if block.Header.BloomFilter != nil {
+				fmt.Printf("Bloom Filter:   Present (serialized)\n")
 			} else {
 				fmt.Printf("Bloom Filter:   None\n")
 			}
-			fmt.Printf("Nonce:          %d\n", block.Nonce)
+			fmt.Printf("Nonce:          %d\n", block.Header.Nonce)
 			fmt.Printf("Hash:           %x\n", block.Hash)
-			pow := core.NewProofOfWork(block, bc.Difficulty)
+			pow := core.NewProofOfWork(block)
 			fmt.Printf("PoW Valid:      %s\n", strconv.FormatBool(pow.Validate()))
 			fmt.Printf("Transactions (%d):\n", len(block.Transactions))
 			for j, tx := range block.Transactions {
@@ -126,12 +120,7 @@ func main() {
 
 			// Bloom filter check example
 			if len(block.Transactions) > 0 {
-				checkTx := block.Transactions[0]
-				maybePresent := block.CheckBloomFilter(checkTx.ID)
-				fmt.Printf("Bloom Check (Tx %x exists?): %t\n", checkTx.ID[:4], maybePresent) // Check first tx ID
-				maybePresent = block.CheckBloomFilter([]byte("non-existent tx"))
-				fmt.Printf("Bloom Check ('non-existent tx' exists?): %t\n", maybePresent)
-				fmt.Println()
+				fmt.Printf("First transaction ID: %x\n", block.Transactions[0].ID[:4])
 			}
 		}
 	}
