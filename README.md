@@ -26,7 +26,7 @@ The vision is to push the boundaries of blockchain design by focusing on:
 
 ## Key Features (Implemented & Planned)
 
-### Implemented (Phase 1 & 2 Completed)
+### Implemented (Phase 1, 2 & Partial Phase 3 Completed)
 
 * **Basic Blockchain Core:** Standard block structure (`Timestamp`, `PrevBlockHash`, `Hash`, `Nonce`), transaction representation, and in-memory chain storage.
 * **Sharding Foundation:**
@@ -35,6 +35,12 @@ The vision is to push the boundaries of blockchain design by focusing on:
     * Per-shard block chains (each shard maintains its own sequence of blocks).
     * Per-shard state management using an in-memory key-value store (`InMemoryStateDB`).
     * Per-shard transaction pool (`TxPool`).
+* **Dynamic Sharding (Ticket 1):**
+    * Implementation of shard metrics tracking (transaction count, state size).
+    * Automatic shard split algorithm when transaction load exceeds configurable thresholds.
+    * Automatic shard merge algorithm for underutilized shards.
+    * Robust fallback routing mechanism when target shards don't exist due to merges.
+    * Management loop for continuous monitoring and dynamic shard adjustments.
 * **Merkle Trees:** Standard Merkle trees for aggregating transaction IDs within each block (`MerkleRoot`).
 * **Approximate Membership Queries (AMQ):** Bloom Filters integrated into blocks (`block.BloomFilter`) to allow fast, probabilistic checking of transaction inclusion (part of Ticket 2).
 * **Proof-of-Work (PoW):** Basic hash-based PoW consensus mechanism used for block mining within each shard.
@@ -44,7 +50,6 @@ The vision is to push the boundaries of blockchain design by focusing on:
 
 ### Planned (Future Phases)
 
-* **Dynamic Sharding (Ticket 1):** Implementing algorithms for shards to split and merge based on load (e.g., transaction volume, state size).
 * **Advanced Merkle Proofs (Ticket 2):** Exploring probabilistic proof compression techniques and potentially cryptographic accumulators for more compact state proofs.
 * **Cross-Shard State Synchronization (Ticket 3):** Developing a robust protocol for atomic or eventually consistent state changes across shards, likely involving verifiable receipts/proofs.
 * **Adaptive Consistency Model (Ticket 4):** Dynamically adjusting consistency levels (e.g., strong vs. eventual) based on network conditions.
@@ -62,8 +67,8 @@ The vision is to push the boundaries of blockchain design by focusing on:
 The system is built around a `core` package containing the essential blockchain logic:
 
 * **`Blockchain`:** The main struct managing the overall system, including the `ShardManager`.
-* **`ShardManager`:** Responsible for creating, managing, and routing transactions to different `Shard` instances.
-* **`Shard`:** Represents a single shard, containing its own `StateDB`, `TxPool`, and processing logic. Each shard maintains its own independent chain of blocks.
+* **`ShardManager`:** Responsible for creating, managing, and routing transactions to different `Shard` instances. Now includes functionality for dynamic shard splitting and merging based on load metrics.
+* **`Shard`:** Represents a single shard, containing its own `StateDB`, `TxPool`, metrics, and processing logic. Each shard maintains its own independent chain of blocks.
 * **`StateDB`:** An interface (`InMemoryStateDB` implementation provided) for storing and retrieving state data (e.g., account balances - although accounts aren't explicitly modeled yet) within a shard.
 * **`Block`:** Represents a block within a specific shard's chain. Contains transactions, metadata, `MerkleRoot`, `BloomFilter`, and links to the previous block *in the same shard*.
 * **`Transaction`:** Represents data submitted to the blockchain. Includes types for intra-shard and cross-shard operations.
@@ -73,7 +78,7 @@ The system is built around a `core` package containing the essential blockchain 
 
 `main.go` acts as a driver program that initializes the sharded blockchain, simulates transaction submission, triggers block mining across shards concurrently, and displays the resulting state.
 
-## Current Status (As of 2025-04-18)
+## Current Status (As of 2025-04-24)
 
 * **Phase 1: Basic Blockchain Setup** - **Completed**
 * **Phase 2: Sharding and State Management** - **Completed**
@@ -81,7 +86,13 @@ The system is built around a `core` package containing the essential blockchain 
     * Bloom filters are integrated into blocks.
     * Basic structures for cross-shard transactions exist.
     * State management is per-shard (in-memory).
-* The project is currently a **Proof-of-Concept**. Key features like dynamic sharding adjustments, full cross-shard atomicity/consistency, and the hybrid consensus mechanism are **not yet implemented**.
+* **Phase 3: Dynamic Sharding and Load Management** - **Partially Completed**
+    * Dynamic shard splitting based on transaction load implemented.
+    * Dynamic shard merging for underutilized shards implemented.
+    * Management loop for continuous monitoring of shards implemented.
+    * Improved transaction routing with fallback mechanisms.
+    * Metrics tracking for shards implemented.
+* The project is currently a **Proof-of-Concept**. More advanced features like full cross-shard atomicity/consistency and the hybrid consensus mechanism are **not yet implemented**.
 
 ## Getting Started
 
@@ -164,17 +175,23 @@ advanced-blockchain-go/
 
 - ✅ **Phase 1:** Basic Blockchain Setup (Tickets 0, 9 partial, 10 partial)
 - ✅ **Phase 2:** Sharding and State Management (Tickets 1 partial, 2 partial, 3 partial, 10 partial)
-- ◻️ **Phase 3:** Consensus and Security (Tickets 6, 7, 8)
+- 🟡 **Phase 3:** Dynamic Sharding and Performance (Ticket 1 mostly complete)
+  - ✅ Implement shard metrics tracking
+  - ✅ Implement dynamic shard splitting
+  - ✅ Implement dynamic shard merging
+  - ✅ Implement management loop for shard monitoring
+  - ◻️ Optimize state redistribution during split/merge
+- ◻️ **Phase 4:** Consensus and Security (Tickets 6, 7, 8)
   - Develop hybrid PoW/dBFT consensus.
   - Implement multi-layer BFT defenses (reputation, etc.).
   - Implement advanced node authentication.
-- ◻️ **Phase 4:** Adaptive Consistency and Conflict Resolution (Tickets 4, 5)
+- ◻️ **Phase 5:** Adaptive Consistency and Conflict Resolution (Tickets 4, 5)
   - Implement adaptive consistency model (CAP Theorem optimization).
   - Implement advanced conflict detection and resolution.
-- ◻️ **Phase 5:** Testing and Documentation (Tickets 11, 12)
+- ◻️ **Phase 6:** Testing and Documentation (Tickets 11, 12)
   - Develop comprehensive integration and simulation tests.
   - Write detailed technical documentation and analysis reports.
-  - Complete implementation of all features from earlier tickets (e.g., dynamic sharding, full cross-shard sync).
+  - Complete implementation of all features from earlier tickets (e.g., full cross-shard sync).
 
 ## Contributing
 
