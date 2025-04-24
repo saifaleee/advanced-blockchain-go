@@ -26,7 +26,7 @@ The vision is to push the boundaries of blockchain design by focusing on:
 
 ## Key Features (Implemented & Planned)
 
-### Implemented (Phase 1, 2 & Partial Phase 3 Completed)
+### Implemented (Phase 1, 2 & Major Progress on Phase 3)
 
 * **Basic Blockchain Core:** Standard block structure (`Timestamp`, `PrevBlockHash`, `Hash`, `Nonce`), transaction representation, and in-memory chain storage.
 * **Sharding Foundation:**
@@ -41,17 +41,24 @@ The vision is to push the boundaries of blockchain design by focusing on:
     * Automatic shard merge algorithm for underutilized shards.
     * Robust fallback routing mechanism when target shards don't exist due to merges.
     * Management loop for continuous monitoring and dynamic shard adjustments.
+    * Efficient state migration during shard splits with load balancing.
+    * Automatic blockchain initialization for newly created shards.
+* **Cross-Shard Transactions:**
+    * Fully implemented and tested cross-shard transaction flow.
+    * Transaction initiation in source shard with proper state changes.
+    * Receipt generation and routing to destination shard.
+    * Finalization transaction processing in destination shard.
+    * End-to-end verification of state consistency across shards.
 * **Merkle Trees:** Standard Merkle trees for aggregating transaction IDs within each block (`MerkleRoot`).
 * **Approximate Membership Queries (AMQ):** Bloom Filters integrated into blocks (`block.BloomFilter`) to allow fast, probabilistic checking of transaction inclusion (part of Ticket 2).
 * **Proof-of-Work (PoW):** Basic hash-based PoW consensus mechanism used for block mining within each shard.
-* **Basic Cross-Shard Handling:** Structures (`CrossShardTxInit`, `CrossShardReceipt`) and placeholder logic for initiating and potentially processing transactions that span shards. Current implementation logs generation of receipts on the source shard during mining.
 * **Basic State Pruning:** Placeholder function to demonstrate removing old blocks from the in-memory shard chains below a specified height.
 * **Comprehensive Unit Tests:** Tests covering core data structures and functionalities (Blocks, Transactions, Merkle Trees, Blockchain, Sharding, State).
 
 ### Planned (Future Phases)
 
 * **Advanced Merkle Proofs (Ticket 2):** Exploring probabilistic proof compression techniques and potentially cryptographic accumulators for more compact state proofs.
-* **Cross-Shard State Synchronization (Ticket 3):** Developing a robust protocol for atomic or eventually consistent state changes across shards, likely involving verifiable receipts/proofs.
+* **Cross-Shard State Synchronization Improvements (Ticket 3):** Enhancing the existing implementation with stronger atomicity guarantees and more efficient verification.
 * **Adaptive Consistency Model (Ticket 4):** Dynamically adjusting consistency levels (e.g., strong vs. eventual) based on network conditions.
 * **Advanced Conflict Resolution (Ticket 5):** Implementing mechanisms using vector clocks, entropy, or VRFs to detect and resolve state conflicts, especially in cross-shard scenarios.
 * **Multi-Layer Adversarial Defense (Ticket 6):** Enhancing BFT with reputation systems, adaptive thresholds, and potentially ZKPs or MPC.
@@ -84,15 +91,18 @@ The system is built around a `core` package containing the essential blockchain 
 * **Phase 2: Sharding and State Management** - **Completed**
     * Foundation for sharding is implemented.
     * Bloom filters are integrated into blocks.
-    * Basic structures for cross-shard transactions exist.
     * State management is per-shard (in-memory).
-* **Phase 3: Dynamic Sharding and Load Management** - **Partially Completed**
+* **Phase 3: Dynamic Sharding and Load Management** - **Almost Complete**
     * Dynamic shard splitting based on transaction load implemented.
     * Dynamic shard merging for underutilized shards implemented.
     * Management loop for continuous monitoring of shards implemented.
     * Improved transaction routing with fallback mechanisms.
     * Metrics tracking for shards implemented.
-* The project is currently a **Proof-of-Concept**. More advanced features like full cross-shard atomicity/consistency and the hybrid consensus mechanism are **not yet implemented**.
+    * Added balanced key migration during shard splits.
+    * Automatic blockchain initialization for new shards.
+    * Cross-shard transaction routing and processing fully implemented.
+    * Deadlock issues in shard management resolved.
+* The project is currently a **Proof-of-Concept** that demonstrates working dynamic sharding and cross-shard transactions. More advanced features like hybrid consensus are still planned for future phases.
 
 ## Getting Started
 
@@ -128,16 +138,14 @@ go run main.go
 ```
 
 This will:
-- Initialize a sharded blockchain (default: 4 shards).
+- Initialize a sharded blockchain (default: 2 shards).
 - Mine genesis blocks for each shard.
 - Generate and route sample transactions (including some cross-shard placeholders).
 - Simulate multiple rounds of concurrent block mining across the shards.
-- Print the detailed contents of each block in every shard's chain.
-- Validate the integrity of all shard chains.
-- Demonstrate the (placeholder) pruning mechanism.
-- Show the final block count per shard after pruning.
-
-Output will show logs detailing transaction routing, mining progress per shard (Nonce found, duration), cross-shard processing placeholders, block contents, validation results, and pruning actions.
+- Monitor shard metrics and perform dynamic shard splits when thresholds are exceeded.
+- Balance load across shards by migrating keys during splits.
+- Process cross-shard transactions from initiation to finalization.
+- Print detailed logs of the entire process.
 
 ### Running Tests
 
@@ -175,12 +183,15 @@ advanced-blockchain-go/
 
 - ✅ **Phase 1:** Basic Blockchain Setup (Tickets 0, 9 partial, 10 partial)
 - ✅ **Phase 2:** Sharding and State Management (Tickets 1 partial, 2 partial, 3 partial, 10 partial)
-- 🟡 **Phase 3:** Dynamic Sharding and Performance (Ticket 1 mostly complete)
+- 🟢 **Phase 3:** Dynamic Sharding and Performance (Ticket 1, 3 partial)
   - ✅ Implement shard metrics tracking
   - ✅ Implement dynamic shard splitting
   - ✅ Implement dynamic shard merging
   - ✅ Implement management loop for shard monitoring
-  - ◻️ Optimize state redistribution during split/merge
+  - ✅ Optimize state redistribution during split/merge
+  - ✅ Implement cross-shard transaction flow
+  - ✅ Fix concurrency and deadlock issues
+  - ✅ Add automatic blockchain initialization for new shards
 - ◻️ **Phase 4:** Consensus and Security (Tickets 6, 7, 8)
   - Develop hybrid PoW/dBFT consensus.
   - Implement multi-layer BFT defenses (reputation, etc.).
@@ -191,7 +202,7 @@ advanced-blockchain-go/
 - ◻️ **Phase 6:** Testing and Documentation (Tickets 11, 12)
   - Develop comprehensive integration and simulation tests.
   - Write detailed technical documentation and analysis reports.
-  - Complete implementation of all features from earlier tickets (e.g., full cross-shard sync).
+  - Complete implementation of all features from earlier tickets.
 
 ## Contributing
 

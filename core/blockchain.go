@@ -19,17 +19,14 @@ type Blockchain struct {
 }
 
 // NewBlockchain creates a new sharded blockchain.
-func NewBlockchain(initialShardCount uint, difficulty int) (*Blockchain, error) {
+func NewBlockchain(initialShardCount uint, config ShardManagerConfig) (*Blockchain, error) {
+	difficulty := 16 // Default difficulty
 	if difficulty < 1 {
 		return nil, errors.New("difficulty must be at least 1")
 	}
 
-	// Create config and convert initialShardCount to int
-	config := DefaultShardManagerConfig()
-	initialShards := int(initialShardCount)
-
 	// Create shard manager with config
-	sm, err := NewShardManager(config, initialShards)
+	sm, err := NewShardManager(config, int(initialShardCount))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create shard manager: %w", err)
 	}
@@ -104,26 +101,57 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 			// 2. Deduct funds/lock state on source shard (using shard.State)
 			// 3. Generate a receipt to be sent to the destination shard
 			log.Printf("Shard %d: Processing cross-shard init Tx %x for dest %d", shardID, tx.ID, *tx.DestinationShard)
-			// Placeholder for state update: shard.State.Put(...)
-			// Create receipt but skip processing for now
-			// The receipt is left here for future implementation
-			_ = &CrossShardReceipt{ // Assign to blank identifier as it's not used yet
+
+			// Create a proper cross-shard receipt
+			receipt := &CrossShardReceipt{
 				SourceShard:      *tx.SourceShard,
 				DestinationShard: *tx.DestinationShard,
 				TransactionID:    tx.ID,
-				// Add proof data here in a real system
+				Data:             tx.Data, // Include transaction data for destination
+				// In a real system, we would also include:
+				// SourceBlockHash: Will be set after block is mined
+				// SourceBlockHeight: Will be set after block is mined
+				// Proof: Merkle proof of inclusion (generated after block creation)
 			}
-			// How to route the receipt? Could be put into a special pool or broadcast.
-			// For simplicity, let's assume another process picks this up.
-			log.Printf("Shard %d: Generated receipt placeholder for Tx %x", shardID, tx.ID)
+
+			// Route the receipt by creating a finalization transaction for the destination shard
+			finalizeTx := NewTransaction(
+				receipt.Data,
+				CrossShardTxFinalize,
+				&receipt.DestinationShard,
+			)
+
+			// Set source reference in the transaction
+			finalizeTx.SourceShard = &receipt.SourceShard
+			// Set a reference to the original transaction ID
+			finalizeTx.SourceReceiptProof = &ReceiptProof{
+				MerkleProof: [][]byte{receipt.TransactionID}, // Simplified, should be actual proof
+			}
+
+			// Add the finalization transaction to the destination shard
+			destShard, destOk := bc.ShardManager.GetShard(receipt.DestinationShard)
+			if destOk {
+				err := destShard.AddTransaction(finalizeTx)
+				if err != nil {
+					log.Printf("Shard %d: Error routing cross-shard finalize tx to shard %d: %v",
+						shardID, receipt.DestinationShard, err)
+				} else {
+					log.Printf("Shard %d: Successfully routed cross-shard finalize tx %x to shard %d",
+						shardID, finalizeTx.ID, receipt.DestinationShard)
+				}
+			} else {
+				log.Printf("Shard %d: Cannot route cross-shard tx, destination shard %d not found",
+					shardID, receipt.DestinationShard)
+			}
+
 			// Include the initiating tx in the block
 			transactionsForBlock = append(transactionsForBlock, tx)
 		} else if tx.Type == CrossShardTxFinalize {
-			// This tx type would likely be generated *in response* to a receipt,
-			// not pulled directly from a generic pool like this.
-			// Placeholder: Requires receipt handling mechanism first.
-			log.Printf("Shard %d: Encountered cross-shard finalize Tx %x (requires receipt processing)", shardID, tx.ID)
-			// Skip adding for now, or handle based on included receipt data (not implemented)
+			// Process finalization transaction
+			log.Printf("Shard %d: Processing cross-shard finalize Tx %x", shardID, tx.ID)
+
+			// Include the finalization transaction in the block
+			transactionsForBlock = append(transactionsForBlock, tx)
 		} else {
 			// Intra-shard transaction
 			// Placeholder for applying tx to shard state: shard.State.Put/Get...
@@ -148,17 +176,38 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 	// Get the latest block *for this shard*
 	bc.ChainMu.RLock() // Use RLock for reading
 	shardChain, chainOk := bc.BlockChains[shardID]
-	if !chainOk || len(shardChain) == 0 {
-		bc.ChainMu.RUnlock()
-		// Should not happen if genesis blocks were created correctly
-		return nil, fmt.Errorf("shard %d chain not found or is empty", shardID)
-	}
-	prevBlock := shardChain[len(shardChain)-1]
 	bc.ChainMu.RUnlock() // Unlock after reading
 
+	// If shard chain doesn't exist yet, initialize it with a genesis block
+	if !chainOk || len(shardChain) == 0 {
+		err := bc.initializeShardChain(shardID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize chain for shard %d: %w", shardID, err)
+		}
+
+		// Get the chain again now that it's initialized
+		bc.ChainMu.RLock()
+		shardChain, chainOk = bc.BlockChains[shardID]
+		if !chainOk || len(shardChain) == 0 {
+			bc.ChainMu.RUnlock()
+			return nil, fmt.Errorf("shard %d chain initialization failed", shardID)
+		}
+		bc.ChainMu.RUnlock()
+	}
+
+	bc.ChainMu.RLock()
+	prevBlock := shardChain[len(shardChain)-1]
+	bc.ChainMu.RUnlock()
+
 	newHeight := prevBlock.Header.Height + 1
-	emptyStateRoot := []byte{} // Replace with actual state root calculation
-	newBlock, err := NewBlock(shardID, transactionsForBlock, prevBlock.Hash, newHeight, emptyStateRoot, bc.Difficulty)
+
+	// Apply state changes for all transactions in the block
+	stateRoot, err := shard.ApplyStateChanges(transactionsForBlock)
+	if err != nil {
+		return nil, fmt.Errorf("failed to apply state changes: %w", err)
+	}
+
+	newBlock, err := NewBlock(shardID, transactionsForBlock, prevBlock.Hash, newHeight, stateRoot, bc.Difficulty)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create new block: %w", err)
 	}
@@ -190,6 +239,35 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 
 	log.Printf("Shard %d: Added Block %d to chain.\n", shardID, newHeight)
 	return newBlock, nil
+}
+
+// initializeShardChain creates a genesis block for a shard and initializes its blockchain
+func (bc *Blockchain) initializeShardChain(shardID uint64) error {
+	// Check if the shard exists in the shard manager
+	_, ok := bc.ShardManager.GetShard(shardID)
+	if !ok {
+		return fmt.Errorf("shard %d not found in shard manager", shardID)
+	}
+
+	// Check if chain already exists
+	bc.ChainMu.RLock()
+	_, exists := bc.BlockChains[shardID]
+	bc.ChainMu.RUnlock()
+
+	if exists {
+		return nil // Chain already initialized
+	}
+
+	// Create genesis block for the shard
+	genesis := NewGenesisBlock(shardID, nil, bc.Difficulty)
+
+	// Add the genesis block to the blockchain
+	bc.ChainMu.Lock()
+	bc.BlockChains[shardID] = []*Block{genesis}
+	bc.ChainMu.Unlock()
+
+	log.Printf("Created Genesis Block for Shard %d\n", shardID)
+	return nil
 }
 
 // GetLatestBlock returns the most recent block for a specific shard.
@@ -359,4 +437,20 @@ func (bc *Blockchain) PruneChain(pruneHeight int) {
 		}
 	}
 	log.Println("Placeholder: Pruning logic finished (simplified).")
+}
+
+// GetShardChain returns the blockchain for a specific shard.
+func (bc *Blockchain) GetShardChain(shardID uint64) []*Block {
+	bc.ChainMu.RLock()
+	defer bc.ChainMu.RUnlock()
+
+	chain, exists := bc.BlockChains[shardID]
+	if !exists {
+		return nil
+	}
+
+	// Return a copy to prevent external modification
+	result := make([]*Block, len(chain))
+	copy(result, chain)
+	return result
 }

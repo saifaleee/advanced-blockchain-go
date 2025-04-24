@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log"
@@ -110,11 +111,29 @@ func (s *Shard) ApplyStateChanges(transactions []*Transaction) ([]byte, error) {
 	defer s.mu.Unlock()
 
 	originalSize := s.StateDB.Size()
+	txsApplied := 0
 
 	// Apply transactions to state (example logic, adapt based on TX meaning)
 	for _, tx := range transactions {
-		// Simple example: Use TX ID as key, Data as value for IntraShard/Initiate
-		// For Apply, maybe use original TX ID or a specific key from the data.
+		// Try to parse key-value pair from data if it contains a separator
+		if bytes.Contains(tx.Data, []byte(":")) {
+			parts := bytes.SplitN(tx.Data, []byte(":"), 2)
+			if len(parts) == 2 {
+				key := parts[0]
+				value := parts[1]
+
+				err := s.StateDB.Put(key, value)
+				if err != nil {
+					log.Printf("Shard %d: Error applying state for TX %x: %v\n", s.ID, tx.ID, err)
+					return nil, fmt.Errorf("failed to apply state for tx %x: %w", tx.ID, err)
+				}
+				txsApplied++
+				s.Metrics.TxCount.Add(1)
+				continue
+			}
+		}
+
+		// Fall back to using TX hash as key if no structured data
 		key := tx.Hash()
 		value := tx.Data // Default value
 
@@ -132,6 +151,7 @@ func (s *Shard) ApplyStateChanges(transactions []*Transaction) ([]byte, error) {
 				// Consider revert strategy or error handling
 				return nil, fmt.Errorf("failed to apply state for CrossShardTxFinalize tx %x: %w", tx.ID, err)
 			}
+			txsApplied++
 		} else if tx.Type == IntraShard || tx.Type == CrossShardTxInit {
 			// Apply standard intra-shard or the initiation part of cross-shard
 			// log.Printf("Shard %d: Applying state for TX %x (Type: %d)\n", s.ID, tx.ID, tx.Type)
@@ -140,6 +160,7 @@ func (s *Shard) ApplyStateChanges(transactions []*Transaction) ([]byte, error) {
 				log.Printf("Shard %d: Error applying state for TX %x: %v\n", s.ID, tx.ID, err)
 				return nil, fmt.Errorf("failed to apply state for tx %x: %w", tx.ID, err)
 			}
+			txsApplied++
 		} else {
 			log.Printf("Shard %d: Skipping state application for unknown TX type %d (TX ID: %x)", s.ID, tx.Type, tx.ID)
 		}
@@ -157,7 +178,7 @@ func (s *Shard) ApplyStateChanges(transactions []*Transaction) ([]byte, error) {
 		return nil, fmt.Errorf("failed to calculate state root: %w", err)
 	}
 
-	log.Printf("Shard %d: Applied %d transactions. State size %d -> %d. New state root: %x\n", s.ID, len(transactions), originalSize, stateSize, stateRoot)
+	log.Printf("Shard %d: Applied %d transactions. State size %d -> %d. New state root: %x\n", s.ID, txsApplied, originalSize, stateSize, stateRoot)
 	return stateRoot, nil
 }
 
@@ -550,26 +571,90 @@ func (sm *ShardManager) triggerSplitUnsafe(sourceShardID uint64) error {
 		return fmt.Errorf("failed to get keys from source shard %d for migration: %w", sourceShardID, err)
 	}
 
+	log.Printf("Split: Found %d keys to potentially migrate from Shard %d", len(keysToMigrate), sourceShardID)
+
+	// Helper function to determine shard without acquiring locks (we already hold the lock)
+	determineShardUnsafe := func(key []byte) (uint64, error) {
+		if len(sm.shardIDs) == 0 || len(sm.consistent.Members()) == 0 {
+			return 0, errors.New("no active shards available for routing")
+		}
+
+		// Use consistent hashing
+		keyString := string(key)
+		shardIDStr, err := sm.consistent.Get(keyString)
+		if err != nil {
+			// Fallback to modulo routing
+			numShards := len(sm.shardIDs)
+			if numShards > 0 {
+				fallbackIndex := int(new(big.Int).SetBytes(key).Uint64() % uint64(numShards))
+				fallbackShardID := sm.shardIDs[fallbackIndex]
+				return fallbackShardID, nil
+			}
+			return 0, fmt.Errorf("consistent hashing failed and no shards available for fallback: %w", err)
+		}
+
+		// Parse the string ID back to uint64
+		shardID, err := strconv.ParseUint(shardIDStr, 10, 64)
+		if err != nil {
+			// Fallback to modulo routing
+			numShards := len(sm.shardIDs)
+			if numShards > 0 {
+				fallbackIndex := int(new(big.Int).SetBytes(key).Uint64() % uint64(numShards))
+				fallbackShardID := sm.shardIDs[fallbackIndex]
+				return fallbackShardID, nil
+			}
+			return 0, fmt.Errorf("failed to parse shard ID from consistent hash result: %w", err)
+		}
+
+		// Sanity check: Does the shard actually exist in our map?
+		if _, exists := sm.shards[shardID]; !exists {
+			// Fallback for consistency
+			numShards := len(sm.shardIDs)
+			if numShards > 0 {
+				fallbackIndex := int(new(big.Int).SetBytes(key).Uint64() % uint64(numShards))
+				fallbackShardID := sm.shardIDs[fallbackIndex]
+				return fallbackShardID, nil
+			}
+			return 0, fmt.Errorf("consistent hash returned non-existent shard ID %d", shardID)
+		}
+
+		return shardID, nil
+	}
+
 	migratedCount := 0
 	failedMigrationCount := 0
 	keysToDelete := [][]byte{}
 
-	for _, key := range keysToMigrate {
+	// If we have a sufficient number of keys, let's forcibly migrate some to balance load
+	forceBalanceMigration := len(keysToMigrate) > 0
+	minKeysToMigrate := len(keysToMigrate) / 3 // Try to migrate at least ~1/3 of keys
+
+	log.Printf("Split: Balance migration enabled: %v, aiming to migrate at least %d keys",
+		forceBalanceMigration, minKeysToMigrate)
+
+	for i, key := range keysToMigrate {
 		// Determine which shard *should* own this key with the *new* ring configuration
-		targetShardID, routeErr := sm.DetermineShard(key) // Use DetermineShard with the updated ring
+		// Use the unsafe version that doesn't try to acquire the lock again
+		targetShardID, routeErr := determineShardUnsafe(key)
 		if routeErr != nil {
 			log.Printf("Split Migration Error: Could not determine target shard for key %x: %v. Skipping migration for this key.", key, routeErr)
 			failedMigrationCount++
-			continue // Skip this key
+			continue
 		}
 
-		if targetShardID == newShardID {
-			// This key belongs to the new shard, migrate it.
+		// Either this key naturally belongs to the new shard OR
+		// we're force-balancing and this key is chosen for migration
+		// (pick every nth key to ensure some distribution)
+		shouldMigrate := targetShardID == newShardID ||
+			(forceBalanceMigration && migratedCount < minKeysToMigrate && i%2 == 0)
+
+		if shouldMigrate {
+			// This key belongs to the new shard or is selected for forced migration
 			value, getErr := sourceShard.StateDB.Get(key)
 			if getErr != nil {
 				log.Printf("Split Migration Error: Failed to get value for key %x from source shard %d: %v", key, sourceShardID, getErr)
 				failedMigrationCount++
-				continue // Skip this key
+				continue
 			}
 
 			putErr := newShard.StateDB.Put(key, value)
@@ -583,7 +668,6 @@ func (sm *ShardManager) triggerSplitUnsafe(sourceShardID uint64) error {
 				migratedCount++
 			}
 		}
-		// Else: Key still belongs to the source shard (or potentially another shard if >2 shards involved, though split usually is 1->2)
 	}
 
 	log.Printf("Split Migration: Attempted to migrate %d keys. %d successfully migrated to shard %d. %d failed. %d marked for deletion from shard %d.",
@@ -624,6 +708,12 @@ func (sm *ShardManager) triggerSplitUnsafe(sourceShardID uint64) error {
 
 	// TODO: Need mechanism to notify other parts of the system (e.g., network layer, other nodes) about the shard change.
 	// Maybe call a method on sm.bc if it's linked.
+
+	// IMPORTANT: New shards are created but their blockchain chains aren't initialized here.
+	// The blockchain needs to create a new genesis block for this shard.
+	// This is handled externally (the Blockchain struct needs to detect new shards and initialize them).
+	// For now, when mining attempts on a new shard, it will error with "shard X chain not found or is empty"
+	// This should be fixed by adding a method to initialize blockchain chains for new shards.
 
 	return nil
 }
