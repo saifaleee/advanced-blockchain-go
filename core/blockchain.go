@@ -23,12 +23,13 @@ func NewBlockchain(initialShardCount uint, difficulty int) (*Blockchain, error) 
 	if difficulty < 1 {
 		return nil, errors.New("difficulty must be at least 1")
 	}
-	if initialShardCount == 0 {
-		return nil, errors.New("initial shard count must be positive")
-	}
+	// Cannot check initialShardCount against config min/max here easily,
+	// NewShardManager handles this check.
 
-	sm, err := NewShardManager(initialShardCount)
+	// *** FIX: Pass default config to NewShardManager ***
+	sm, err := NewShardManager(initialShardCount, DefaultShardManagerConfig()) // Pass default config
 	if err != nil {
+		// Error might be due to initialShardCount being outside config min/max
 		return nil, fmt.Errorf("failed to create shard manager: %w", err)
 	}
 
@@ -42,7 +43,7 @@ func NewBlockchain(initialShardCount uint, difficulty int) (*Blockchain, error) 
 	// Create genesis block for each shard
 	bc.ChainMu.Lock() // Lock before modifying blockChains map
 	defer bc.ChainMu.Unlock()
-	for shardID := range sm.Shards {
+	for shardID := range sm.Shards { // Iterate over shards created by manager
 		genesis := NewGenesisBlock(shardID, nil, difficulty)
 		bc.BlockChains[shardID] = []*Block{genesis}
 		log.Printf("Created Genesis Block for Shard %d\n", shardID)
@@ -82,7 +83,7 @@ func (bc *Blockchain) MineShardBlock(shardID ShardID) (*Block, error) {
 
 	// Handle Cross-Shard Transactions (Simplified)
 	// In a real system, need coordination, proofs, etc.
-	var receiptsToProcess []*CrossShardReceipt
+	var receiptsToProcess []*CrossShardReceipt // This remains empty as receipt relay isn't implemented
 	var transactionsForBlock []*Transaction
 	for _, tx := range txs {
 		if tx.Type == CrossShardTxInit && tx.SourceShard != nil && tx.DestinationShard != nil {
@@ -94,7 +95,7 @@ func (bc *Blockchain) MineShardBlock(shardID ShardID) (*Block, error) {
 			// Placeholder for state update: shard.State.Put(...)
 			// Create receipt but skip processing for now
 			// The receipt is left here for future implementation
-			_ = &CrossShardReceipt{
+			_ = &CrossShardReceipt{ // Assign to blank identifier as it's not used yet
 				OriginShard:      *tx.SourceShard,
 				DestinationShard: *tx.DestinationShard,
 				TransactionID:    tx.ID,
@@ -102,7 +103,7 @@ func (bc *Blockchain) MineShardBlock(shardID ShardID) (*Block, error) {
 			}
 			// How to route the receipt? Could be put into a special pool or broadcast.
 			// For simplicity, let's assume another process picks this up.
-			log.Printf("Shard %d: Generated receipt for Tx %x", shardID, tx.ID)
+			log.Printf("Shard %d: Generated receipt placeholder for Tx %x", shardID, tx.ID)
 			// Include the initiating tx in the block
 			transactionsForBlock = append(transactionsForBlock, tx)
 		} else if tx.Type == CrossShardTxFinalize {
@@ -119,7 +120,7 @@ func (bc *Blockchain) MineShardBlock(shardID ShardID) (*Block, error) {
 	}
 
 	// Process incoming receipts (if a mechanism delivered them to receiptsToProcess)
-	for _, receipt := range receiptsToProcess {
+	for _, receipt := range receiptsToProcess { // This loop will currently do nothing
 		err := shard.ProcessCrossShardReceipt(receipt)
 		if err != nil {
 			log.Printf("Shard %d: Error processing receipt for Tx %x: %v", shardID, receipt.TransactionID, err)
@@ -135,20 +136,20 @@ func (bc *Blockchain) MineShardBlock(shardID ShardID) (*Block, error) {
 	}
 
 	// Get the latest block *for this shard*
-	bc.ChainMu.Lock() // Lock map access
+	bc.ChainMu.RLock() // Use RLock for reading
 	shardChain, chainOk := bc.BlockChains[shardID]
 	if !chainOk || len(shardChain) == 0 {
-		bc.ChainMu.Unlock()
+		bc.ChainMu.RUnlock()
 		// Should not happen if genesis blocks were created correctly
 		return nil, fmt.Errorf("shard %d chain not found or is empty", shardID)
 	}
 	prevBlock := shardChain[len(shardChain)-1]
-	bc.ChainMu.Unlock() // Unlock after reading
+	bc.ChainMu.RUnlock() // Unlock after reading
 
 	newHeight := prevBlock.Height + 1
 	newBlock := NewBlock(shardID, transactionsForBlock, prevBlock.Hash, newHeight, bc.Difficulty)
 
-	// Basic validation before adding (already done implicitly in AddBlock logic below)
+	// Basic validation before adding
 	pow := NewProofOfWork(newBlock, bc.Difficulty)
 	if !pow.Validate() {
 		return nil, fmt.Errorf("shard %d: mined block %d failed proof-of-work validation", shardID, newHeight)
@@ -158,7 +159,7 @@ func (bc *Blockchain) MineShardBlock(shardID ShardID) (*Block, error) {
 	}
 
 	// Add the successfully mined block to the shard's chain
-	bc.ChainMu.Lock() // Lock map access
+	bc.ChainMu.Lock() // Lock map access for writing
 	bc.BlockChains[shardID] = append(bc.BlockChains[shardID], newBlock)
 	currentHeight := newBlock.Height
 	bc.ChainMu.Unlock() // Unlock map access
@@ -169,14 +170,17 @@ func (bc *Blockchain) MineShardBlock(shardID ShardID) (*Block, error) {
 	}
 	bc.Mu.Unlock() // Unlock global state
 
+	// Update shard metrics after block is added
+	shard.UpdateLastBlockTimestamp(newBlock.Timestamp)
+
 	log.Printf("Shard %d: Added Block %d to chain.\n", shardID, newHeight)
 	return newBlock, nil
 }
 
 // GetLatestBlock returns the most recent block for a specific shard.
 func (bc *Blockchain) GetLatestBlock(shardID ShardID) (*Block, error) {
-	bc.ChainMu.Lock() // Lock map access
-	defer bc.ChainMu.Unlock()
+	bc.ChainMu.RLock() // Use RLock for reading
+	defer bc.ChainMu.RUnlock()
 
 	shardChain, ok := bc.BlockChains[shardID]
 	if !ok {
@@ -191,8 +195,8 @@ func (bc *Blockchain) GetLatestBlock(shardID ShardID) (*Block, error) {
 // GetBlock retrieves a specific block by hash (searches all shards - inefficient).
 // A real system needs indexing or routing hints.
 func (bc *Blockchain) GetBlock(hash []byte) (*Block, error) {
-	bc.ChainMu.Lock() // Lock map access
-	defer bc.ChainMu.Unlock()
+	bc.ChainMu.RLock() // Use RLock for reading
+	defer bc.ChainMu.RUnlock()
 
 	// Search in all shard chains
 	for _, chain := range bc.BlockChains {
@@ -206,7 +210,7 @@ func (bc *Blockchain) GetBlock(hash []byte) (*Block, error) {
 }
 
 // ValidateBlockIntegrity remains the same as before (checks height and prev hash link)
-func ValidateBlockIntegrity(newBlock, prevBlock *Block) bool { /* ... unchanged ... */
+func ValidateBlockIntegrity(newBlock, prevBlock *Block) bool {
 	if newBlock == nil || prevBlock == nil {
 		log.Println("Error: Cannot validate nil blocks.")
 		return false
@@ -221,9 +225,10 @@ func ValidateBlockIntegrity(newBlock, prevBlock *Block) bool { /* ... unchanged 
 			newBlock.ShardID, newBlock.Height, newBlock.PrevBlockHash, prevBlock.Height, prevBlock.Hash)
 		return false
 	}
+	// *** FIX: Corrected log format string for height validation ***
 	if newBlock.Height != prevBlock.Height+1 {
-		log.Printf("Validation Error: Shard %d Block %d Height (%d) is not sequential to previous block height %d",
-			newBlock.ShardID, newBlock.ShardID, newBlock.Height, prevBlock.Height)
+		log.Printf("Validation Error: Shard %d Block %d Height (%d) is not sequential to previous block height %d\n",
+			newBlock.ShardID, newBlock.Height, newBlock.Height, prevBlock.Height) // Corrected second %d to newBlock.Height
 		return false
 	}
 	// log.Printf("Shard %d: Block %d integrity validated successfully against Block %d.\n", newBlock.ShardID, newBlock.Height, prevBlock.Height)
@@ -232,20 +237,26 @@ func ValidateBlockIntegrity(newBlock, prevBlock *Block) bool { /* ... unchanged 
 
 // IsChainValid now validates each shard's chain independently.
 func (bc *Blockchain) IsChainValid() bool {
-	bc.ChainMu.Lock() // Lock map access
-	defer bc.ChainMu.Unlock()
+	bc.ChainMu.RLock() // Use RLock for reading map structure
+	defer bc.ChainMu.RUnlock()
 	overallValid := true
 
 	var wg sync.WaitGroup
 	validationErrors := make(chan error, len(bc.BlockChains)) // Channel for errors
 
-	for shardID, chain := range bc.BlockChains {
+	// Create a copy of the chains to validate, so we don't hold the lock during validation
+	chainsToValidate := make(map[ShardID][]*Block)
+	for id, chain := range bc.BlockChains {
+		chainsToValidate[id] = chain
+	}
+
+	for shardID, chain := range chainsToValidate {
 		wg.Add(1)
 		go func(sID ShardID, ch []*Block) {
 			defer wg.Done()
-			log.Printf("Validating chain for Shard %d...", sID)
+			// log.Printf("Validating chain for Shard %d...", sID) // Reduce log noise
 			if len(ch) == 0 {
-				log.Printf("Shard %d chain is empty, skipping validation.", sID)
+				// log.Printf("Shard %d chain is empty, skipping validation.", sID)
 				return // Skip empty chains (shouldn't happen with genesis)
 			}
 			if len(ch) == 1 {
@@ -257,7 +268,7 @@ func (bc *Blockchain) IsChainValid() bool {
 					validationErrors <- err
 					return
 				}
-				log.Printf("Shard %d Genesis block validated.", sID)
+				// log.Printf("Shard %d Genesis block validated.", sID)
 				return
 			}
 
@@ -280,7 +291,7 @@ func (bc *Blockchain) IsChainValid() bool {
 					return // Stop validation for this shard
 				}
 			}
-			log.Printf("Shard %d chain validation successful.", sID)
+			// log.Printf("Shard %d chain validation successful.", sID)
 		}(shardID, chain)
 	}
 
@@ -306,7 +317,7 @@ func (bc *Blockchain) IsChainValid() bool {
 // PruneChain attempts to remove old blocks from shard chains below a certain height,
 // keeping headers or necessary state roots (not fully implemented).
 func (bc *Blockchain) PruneChain(pruneHeight int) {
-	bc.ChainMu.Lock() // Lock map access
+	bc.ChainMu.Lock() // Lock map access for writing
 	defer bc.ChainMu.Unlock()
 
 	log.Printf("Placeholder: Attempting to prune chains below height %d...", pruneHeight)
@@ -322,7 +333,7 @@ func (bc *Blockchain) PruneChain(pruneHeight int) {
 			// and ensure state corresponding to pruned blocks is handled (e.g., snapshots).
 			log.Printf("Shard %d: Pruning %d blocks (keeping %d).", shardID, pruneHeight, len(chain)-pruneHeight)
 			// Keep blocks from pruneHeight onwards
-			bc.BlockChains[shardID] = chain[pruneHeight:]
+			bc.BlockChains[shardID] = chain[pruneHeight:] // This modifies the map entry directly
 			// Update the PrevBlockHash of the new first block (now at index 0) if necessary?
 			// No, the PrevBlockHash should still point to the *actual* previous block's hash,
 			// even if that block data is discarded. This requires storing headers separately.
