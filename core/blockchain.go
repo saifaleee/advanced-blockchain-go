@@ -170,13 +170,7 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 	}
 	proposer, ok := bc.ValidatorMgr.GetValidator(proposerNodeID)
 	if !ok {
-		// If the local node isn't a validator, it shouldn't propose blocks in dBFT.
-		// For simulation, allow non-validators to propose PoW, but they might fail dBFT.
 		log.Printf("Warning: Node %s proposing for shard %d is not a registered validator.", proposerNodeID, shardID)
-		// Create a temporary validator struct for reputation tracking if needed, or disallow.
-		// Let's disallow for stricter simulation:
-		// return nil, fmt.Errorf("node %s cannot propose block for shard %d: not a validator", proposerNodeID, shardID)
-		// OR allow but create a temporary validator for simulation:
 		proposer = &Validator{Node: &Node{ID: proposerNodeID}} // Temporary, won't be in manager
 		proposer.Node.Authenticate()                           // Assume authenticated for simulation
 	}
@@ -186,22 +180,15 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 	txsRaw := shard.GetTransactionsForBlock(maxTxPerBlock)
 	transactionsForProposal := make([]*Transaction, 0, len(txsRaw))
 
-	// Process raw transactions, handle cross-shard init, create final list
 	for _, tx := range txsRaw {
 		if tx.Type == CrossShardTxInit && tx.SourceShard != nil && tx.DestinationShard != nil {
-			// Check if initiating shard matches current shard
 			if *tx.SourceShard != shardID {
 				log.Printf("Error: CrossShardTxInit %x found in shard %d, but SourceShard field is %d. Re-routing or discarding.", tx.ID, shardID, *tx.SourceShard)
-				// Option 1: Discard (simplest)
 				continue
-				// Option 2: Try to re-route (adds complexity)
-				// bc.AddTransaction(tx) // Could cause loops if routing is flawed
-				// continue
 			}
 
 			log.Printf("Shard %d: Processing cross-shard init Tx %x for dest %d", shardID, tx.ID, *tx.DestinationShard)
-			// Create finalize TX and route it to destination shard
-			receipt := &CrossShardReceipt{ /* ... fields ... */
+			receipt := &CrossShardReceipt{
 				SourceShard:      *tx.SourceShard,
 				DestinationShard: *tx.DestinationShard,
 				TransactionID:    tx.ID,
@@ -209,29 +196,24 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 			}
 			finalizeTx := NewTransaction(receipt.Data, CrossShardTxFinalize, &receipt.DestinationShard)
 			finalizeTx.SourceShard = &receipt.SourceShard
-			finalizeTx.SourceReceiptProof = &ReceiptProof{MerkleProof: [][]byte{receipt.TransactionID}} // Placeholder proof
+			finalizeTx.SourceReceiptProof = &ReceiptProof{MerkleProof: [][]byte{receipt.TransactionID}}
 
 			destShard, destOk := bc.ShardManager.GetShard(receipt.DestinationShard)
 			if destOk {
-				err := destShard.AddTransaction(finalizeTx) // Route finalization TX
+				err := destShard.AddTransaction(finalizeTx)
 				if err != nil {
 					log.Printf("Shard %d: Error routing cross-shard finalize tx %x to shard %d: %v", shardID, finalizeTx.ID, receipt.DestinationShard, err)
-					// If routing fails, should we abort including the init tx? Or proceed?
-					// Proceed for now, but log error. Destination state won't be updated.
 				} else {
 					log.Printf("Shard %d: Routed finalize tx %x for %x to dest shard %d", shardID, finalizeTx.ID, tx.ID, receipt.DestinationShard)
 				}
 			} else {
 				log.Printf("Shard %d: Cannot route finalize tx %x for %x, dest shard %d not found", shardID, finalizeTx.ID, tx.ID, receipt.DestinationShard)
-				// Abort including the init tx if destination doesn't exist? Safer.
 				log.Printf("Shard %d: Discarding cross-shard init Tx %x due to missing destination shard %d", shardID, tx.ID, *tx.DestinationShard)
-				continue // Skip adding this init tx to the block
+				continue
 			}
-			// Include the initiating tx in the block proposal
 			transactionsForProposal = append(transactionsForProposal, tx)
 
 		} else if tx.Type == CrossShardTxFinalize {
-			// Check if destination shard matches current shard
 			if tx.DestinationShard == nil || *tx.DestinationShard != shardID {
 				log.Printf("Error: CrossShardTxFinalize %x found in shard %d, but DestinationShard field is missing or incorrect (%v). Discarding.", tx.ID, shardID, tx.DestinationShard)
 				continue
@@ -239,26 +221,17 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 			log.Printf("Shard %d: Including cross-shard finalize Tx %x", shardID, tx.ID)
 			transactionsForProposal = append(transactionsForProposal, tx)
 		} else if tx.Type == IntraShard {
-			// Standard intra-shard transaction
 			transactionsForProposal = append(transactionsForProposal, tx)
 		} else {
 			log.Printf("Shard %d: Skipping transaction %x with unknown type %d", shardID, tx.ID, tx.Type)
 		}
 	}
 
-	// Allow empty blocks? Let's require at least one TX for now unless it's the genesis block.
-	// if len(transactionsForProposal) == 0 {
-	//  log.Printf("Shard %d: No valid transactions selected for block proposal.", shardID)
-	//  return nil, errors.New("no transactions to mine")
-	// }
-
-	// --- 3. Get Previous Block and Apply State ---
 	bc.ChainMu.RLock()
 	shardChain, chainOk := bc.BlockChains[shardID]
 	bc.ChainMu.RUnlock()
 
 	if !chainOk || len(shardChain) == 0 {
-		// Attempt to initialize if missing (e.g., for dynamically added shards)
 		err := bc.initializeShardChain(shardID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize chain for shard %d: %w", shardID, err)
@@ -266,7 +239,7 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 		bc.ChainMu.RLock()
 		shardChain, chainOk = bc.BlockChains[shardID]
 		bc.ChainMu.RUnlock()
-		if !chainOk || len(shardChain) == 0 { // Check again after init attempt
+		if !chainOk || len(shardChain) == 0 {
 			return nil, fmt.Errorf("shard %d chain initialization failed or chain empty", shardID)
 		}
 	}
@@ -276,94 +249,52 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 	bc.ChainMu.RUnlock()
 	newHeight := prevBlock.Header.Height + 1
 
-	// Apply state changes *before* proposing block to get the correct StateRoot
 	stateRoot, err := shard.ApplyStateChanges(transactionsForProposal)
 	if err != nil {
-		// If state application fails, we cannot propose the block.
-		// TODO: Need to roll back any partial state changes if StateDB supports it.
-		// For InMemoryStateDB, changes are likely committed. This is a limitation.
-		log.Printf("CRITICAL: Shard %d failed to apply state changes for potential block %d: %v. Transactions potentially lost state.", shardID, newHeight, err)
-		// Return the transactions to the pool? Requires careful handling.
-		// For now, fail the mining attempt.
 		return nil, fmt.Errorf("failed to apply state changes for shard %d, block %d: %w", shardID, newHeight, err)
 	}
 
-	// --- 4. Propose Block (PoW) ---
-	// Pass previous block's Vector Clock to ProposeBlock
 	proposedBlock, err := ProposeBlock(shardID, transactionsForProposal, prevBlock.Hash, newHeight, stateRoot, bc.Difficulty, proposerNodeID, prevBlock.Header.VectorClock)
 	if err != nil {
 		log.Printf("Shard %d: Failed to propose block H:%d: %v", shardID, newHeight, err)
-		// If proposing fails (e.g., PoW timeout), need to decide how to handle txs.
-		// Re-add txs to pool? For simulation, just fail.
 		return nil, fmt.Errorf("block proposal failed for shard %d: %w", shardID, err)
 	}
 
-	// Inside func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error)
-
-	// ... (after block proposal, before consensus) ...
-
-	// --- 5. Finalize Block (Simulated dBFT with Adaptive Consistency) ---
-	currentConsistencyLevel := bc.Consistency.GetCurrentLevel() // <<< GET Current Level
+	currentConsistencyLevel := bc.Consistency.GetCurrentLevel()
 	log.Printf("Shard %d: Running consensus with %s consistency level.", shardID, currentConsistencyLevel)
 
-	// Modify the SimulateDBFT call:
 	consensusReached, agreeingValidators := bc.ValidatorMgr.SimulateDBFT(
 		proposedBlock,
 		proposer,
-		currentConsistencyLevel, // <<< PASS Level
-		bc.Consistency,          // <<< PASS Orchestrator (for timeouts etc.)
+		currentConsistencyLevel,
+		bc.Consistency,
 	)
 
 	if !consensusReached {
 		log.Printf("Shard %d: Consensus failed for proposed block H:%d under %s consistency. Discarding block.",
-			shardID, newHeight, currentConsistencyLevel) // Log level
-		// TODO: Handle transactions from failed block (e.g., return to pool)
-		// For now, they are effectively dropped.
-		return nil, fmt.Errorf("dBFT consensus failed (%s level)", currentConsistencyLevel) // Include level in error
+			shardID, newHeight, currentConsistencyLevel)
+		return nil, fmt.Errorf("dBFT consensus failed (%s level)", currentConsistencyLevel)
 	}
 
-	// --- 6. Mark Block as Final & Validate ---
 	proposedBlock.Finalize(agreeingValidators)
 
-	// Perform final validation checks (including new fields and Vector Clock)
-	if !ValidateBlockIntegrity(proposedBlock, prevBlock, bc.ValidatorMgr) { // Pass ValidatorMgr
+	if !ValidateBlockIntegrity(proposedBlock, prevBlock, bc.ValidatorMgr) {
 		log.Printf("Shard %d: CRITICAL - Finalized block H:%d failed integrity validation!", shardID, newHeight)
-		// This should ideally not happen if dBFT simulation was correct, but check anyway.
-		// Need robust handling here (panic? halt shard?)
 		return nil, fmt.Errorf("finalized block %d failed integrity check", newHeight)
 	}
-	// PoW validation was implicitly checked during dBFT simulation, but can re-check.
-	// ... (PoW re-check remains the same) ...
 
-	// --- 7. Add Finalized Block to Chain ---
 	bc.ChainMu.Lock()
 	bc.BlockChains[shardID] = append(bc.BlockChains[shardID], proposedBlock)
 	currentHeight := proposedBlock.Header.Height
 	bc.ChainMu.Unlock()
 
-	// Update global chain height metric
 	bc.Mu.Lock()
 	if int(currentHeight) > bc.ChainHeight {
 		bc.ChainHeight = int(currentHeight)
 	}
 	bc.Mu.Unlock()
 
-	// Update shard metrics (e.g., block count)
 	shard.Metrics.BlockCount.Add(1)
-
-	// --- Ticket 5: Placeholder for Conflict Detection/Resolution ---
-	// Entropy Check (Placeholder)
-	// entropyLevel := shard.CalculateStateEntropy() // Hypothetical function
-	// if entropyLevel > threshold {
-	//  log.Printf("Shard %d: High state entropy detected (%f). Potential conflicts.", shardID, entropyLevel)
-	// }
-
-	// VRF-based Resolution (Placeholder)
-	// if potentialConflictDetected {
-	//  winningVersion := ResolveConflictWithVRF(conflictingKeys)
-	//  // Apply winning version state changes
-	// }
-	// -------------------------------------------------------------
 
 	log.Printf("Shard %d: ===> Successfully Proposed, Finalized, and Added Block H:%d. Hash: %x... VC: %v <===",
 		shardID, newHeight, safeSlice(proposedBlock.Hash, 4), proposedBlock.Header.VectorClock)
@@ -374,24 +305,20 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 // initializeShardChain creates a genesis block for a shard and initializes its blockchain
 // Uses the Blockchain's GenesisProposer ID.
 func (bc *Blockchain) initializeShardChain(shardID uint64) error {
-	// Check if the shard exists in the shard manager
 	if _, ok := bc.ShardManager.GetShard(shardID); !ok {
 		return fmt.Errorf("cannot initialize chain: shard %d not found in shard manager", shardID)
 	}
 
-	bc.ChainMu.Lock() // Lock for potential map modification
+	bc.ChainMu.Lock()
 	defer bc.ChainMu.Unlock()
 
-	// Double-check if chain was created between the initial check and acquiring the lock
 	if _, exists := bc.BlockChains[shardID]; exists {
-		return nil // Chain already initialized
+		return nil
 	}
 
-	// Create genesis block for the shard using the designated proposer
 	log.Printf("Initializing chain for dynamically added Shard %d...", shardID)
 	genesis := NewGenesisBlock(shardID, nil, bc.Difficulty, bc.GenesisProposer)
 
-	// Add the genesis block to the blockchain map
 	bc.BlockChains[shardID] = []*Block{genesis}
 
 	log.Printf("Created Genesis Block for Shard %d by %s\n", shardID, bc.GenesisProposer)
@@ -448,62 +375,48 @@ func ValidateBlockIntegrity(newBlock, prevBlock *Block, vm *ValidatorManager) bo
 		return false
 	}
 
-	// --- Phase 4 Checks ---
 	if newBlock.Header.ProposerID == "" {
 		log.Printf("Validation Error: Shard %d Block %d has empty ProposerID.", newBlock.Header.ShardID, newBlock.Header.Height)
 		return false
 	}
-	// Check if proposer exists and is authenticated (optional, depends on strictness)
 	proposer, exists := vm.GetValidator(newBlock.Header.ProposerID)
 	if !exists {
-		// Allow non-validator proposers for now if node ID is set, but log warning
-		// log.Printf("Validation Warning: Proposer %s for Shard %d Block %d is not a registered validator.", newBlock.Header.ProposerID, newBlock.Header.ShardID, newBlock.Header.Height)
-		// If strict, return false here.
 	} else if !proposer.Node.IsAuthenticated.Load() {
 		log.Printf("Validation Error: Proposer %s for Shard %d Block %d is not authenticated.", newBlock.Header.ProposerID, newBlock.Header.ShardID, newBlock.Header.Height)
-		return false // Proposer must be authenticated
+		return false
 	}
 
-	// Check if finality signatures exist (basic check)
-	// Genesis block might have special finality.
 	isGenesis := newBlock.Header.Height == 0
 	if !isGenesis && len(newBlock.Header.FinalitySignatures) == 0 {
 		log.Printf("Validation Error: Shard %d Block %d (non-genesis) has no finality signatures.", newBlock.Header.ShardID, newBlock.Header.Height)
 		return false
 	}
 
-	// --- Ticket 5: Vector Clock Causality Check ---
 	comparison := newBlock.Header.VectorClock.Compare(prevBlock.Header.VectorClock)
-	// The new block's clock must happen after or be concurrent (only if identical, which shouldn't happen if incremented)
-	// It must strictly dominate the previous block's clock in its own shard entry.
-	if comparison == -1 { // newBlock.VC < prevBlock.VC (Invalid - time went backwards)
+	if comparison == -1 {
 		log.Printf("Validation Error: Shard %d Block %d VectorClock (%v) is causally BEFORE previous block (%v).",
 			newBlock.Header.ShardID, newBlock.Header.Height, newBlock.Header.VectorClock, prevBlock.Header.VectorClock)
 		return false
 	}
-	// Check that the current shard's entry was incremented
 	newShardEntry := newBlock.Header.VectorClock[newBlock.Header.ShardID]
-	prevShardEntry := prevBlock.Header.VectorClock[prevBlock.Header.ShardID] // Can be 0 if key didn't exist
+	prevShardEntry := prevBlock.Header.VectorClock[prevBlock.Header.ShardID]
 	if newShardEntry != prevShardEntry+1 {
 		log.Printf("Validation Error: Shard %d Block %d VectorClock entry for shard %d (%d) was not incremented correctly from previous block (%d).",
 			newBlock.Header.ShardID, newBlock.Header.Height, newBlock.Header.ShardID, newShardEntry, prevShardEntry)
 		return false
 	}
-	// Optional: Check that other shard entries are >= previous block's entries
 	for shardID, prevVal := range prevBlock.Header.VectorClock {
 		if shardID == newBlock.Header.ShardID {
-			continue // Already checked increment
+			continue
 		}
 		newVal, ok := newBlock.Header.VectorClock[shardID]
-		if !ok || newVal < prevVal { // New clock must have at least the knowledge of the previous one
+		if !ok || newVal < prevVal {
 			log.Printf("Validation Error: Shard %d Block %d VectorClock entry for other shard %d (%d) is less than previous block's entry (%d).",
 				newBlock.Header.ShardID, newBlock.Header.Height, shardID, newVal, prevVal)
 			return false
 		}
 	}
-	// ---------------------------------------------------
 
-	// log.Printf("Shard %d: Block %d integrity validated successfully against Block %d.", newBlock.Header.ShardID, newBlock.Header.Height, prevBlock.Header.Height)
 	return true
 }
 
@@ -516,7 +429,6 @@ func (bc *Blockchain) IsChainValid() bool {
 	var wg sync.WaitGroup
 	errorChan := make(chan error, len(bc.BlockChains))
 
-	// Copy chains to avoid holding lock during long validation
 	chainsToValidate := make(map[uint64][]*Block)
 	for id, chain := range bc.BlockChains {
 		copiedChain := make([]*Block, len(chain))
@@ -526,13 +438,12 @@ func (bc *Blockchain) IsChainValid() bool {
 
 	for shardID, chain := range chainsToValidate {
 		wg.Add(1)
-		go func(sID uint64, ch []*Block, vm *ValidatorManager) { // Pass validator manager
+		go func(sID uint64, ch []*Block, vm *ValidatorManager) {
 			defer wg.Done()
 			if len(ch) == 0 {
-				return // Skip empty
+				return
 			}
 
-			// Validate Genesis Block
 			genesis := ch[0]
 			powGenesis := NewProofOfWork(genesis)
 			if !powGenesis.Validate() {
@@ -543,48 +454,40 @@ func (bc *Blockchain) IsChainValid() bool {
 				errorChan <- fmt.Errorf("shard %d genesis block has empty ProposerID", sID)
 				return
 			}
-			// Genesis finality check (allow special "GENESIS" marker)
 			if len(genesis.Header.FinalitySignatures) == 0 {
 				errorChan <- fmt.Errorf("shard %d genesis block has no finality signatures", sID)
 				return
 			}
-			// Genesis Vector Clock check (should have entry 1 for its own shard)
 			if genesis.Header.VectorClock == nil || genesis.Header.VectorClock[sID] != 1 {
 				errorChan <- fmt.Errorf("shard %d genesis block has invalid vector clock: %v", sID, genesis.Header.VectorClock)
 				return
 			}
 
 			if len(ch) == 1 {
-				return // Only genesis, already checked
+				return
 			}
 
-			// Validate subsequent blocks
 			for i := 1; i < len(ch); i++ {
 				currentBlock := ch[i]
 				prevBlock := ch[i-1]
 
-				// Check PoW
 				pow := NewProofOfWork(currentBlock)
 				if !pow.Validate() {
 					errorChan <- fmt.Errorf("shard %d PoW validation failed for Block H:%d (Hash: %x)", sID, currentBlock.Header.Height, currentBlock.Hash)
 					return
 				}
 
-				// Check Integrity (includes proposer/finality/VC checks)
 				if !ValidateBlockIntegrity(currentBlock, prevBlock, vm) {
-					// Specific error logged within ValidateBlockIntegrity
 					errorChan <- fmt.Errorf("shard %d integrity validation failed between Block H:%d and H:%d", sID, prevBlock.Header.Height, currentBlock.Header.Height)
 					return
 				}
 			}
-			// log.Printf("Shard %d chain validation successful.", sID)
-		}(shardID, chain, bc.ValidatorMgr) // Pass validator manager to goroutine
+		}(shardID, chain, bc.ValidatorMgr)
 	}
 
 	wg.Wait()
 	close(errorChan)
 
-	// Collect and report errors
 	errCount := 0
 	for err := range errorChan {
 		if err != nil {
@@ -605,27 +508,10 @@ func (bc *Blockchain) IsChainValid() bool {
 
 // PruneChain remains the same conceptual placeholder.
 func (bc *Blockchain) PruneChain(pruneHeight int) {
-	// ... (implementation as before) ...
 	log.Println("Placeholder: Pruning logic finished (simplified).")
 }
 
 // GetShardChain remains the same.
 func (bc *Blockchain) GetShardChain(shardID uint64) []*Block {
-	// ... (implementation as before) ...
-	return nil // Placeholder return
+	return nil
 }
-
-// --- Helper for cross-shard in MineShardBlock ---
-// Placeholder, implement actual receipt logic if needed
-// type CrossShardReceipt struct {
-// 	SourceShard      uint64
-// 	DestinationShard uint64
-// 	TransactionID    []byte
-// 	Data             []byte
-// 	// Add SourceBlockHash, Height, Proof etc.
-// }
-
-// // Placeholder
-// type ReceiptProof struct {
-// 	MerkleProof [][]byte
-// }

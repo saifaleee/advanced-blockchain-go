@@ -31,10 +31,7 @@ type BlockHeader struct {
 	// In a real system, FinalitySignatures would be actual crypto signatures
 
 	// --- Ticket 5: Conflict Resolution ---
-	VectorClock VectorClock // Tracks causal history of the block
-
-	// --- Suggested Change ---
-	Clock VectorClock // Vector clock representing state after this block
+	VectorClock VectorClock // Tracks causal history of the block (Renamed from Clock)
 }
 
 // Block represents a block in the blockchain.
@@ -76,7 +73,7 @@ func (pow *ProofOfWork) Target() *big.Int {
 func (pow *ProofOfWork) prepareData(nonce int64) []byte {
 	header := pow.block.Header
 	// Serialize VectorClock for hashing
-	vcBytes, err := header.VectorClock.Serialize() // Assuming a Serialize method exists
+	vcBytes, err := header.VectorClock.Serialize() // Use the renamed field VectorClock
 	if err != nil {
 		log.Printf("CRITICAL: Failed to serialize vector clock for hashing block %d: %v", header.Height, err)
 		// Handle error appropriately - maybe return an error or use a placeholder?
@@ -179,7 +176,6 @@ func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []b
 		ProposerID:    proposerID, // Set proposer ID
 		// VectorClock will be calculated below
 		// Nonce, BloomFilter, Hash, FinalitySignatures will be set below or later
-		Clock: prevBlockVC.Copy(), // Initialize with a copy of previous block's clock
 	}
 
 	block := &Block{
@@ -197,7 +193,7 @@ func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []b
 	}
 	// Increment the clock for the current shard
 	blockVC[shardID]++
-	block.Header.VectorClock = blockVC
+	block.Header.VectorClock = blockVC // Assign to the renamed field
 	// -----------------------------------
 
 	// Calculate Merkle Root
@@ -293,7 +289,6 @@ func NewGenesisBlock(shardID uint64, coinbase *Transaction, difficulty int, gene
 			ProposerID:         genesisProposer,
 			FinalitySignatures: []NodeID{"GENESIS"}, // Mark as finalized by "GENESIS"
 			VectorClock:        genesisVC,           // Set fallback VC
-			Clock:              genesisVC,           // Set fallback Clock
 		}
 		block = &Block{
 			Header:       header,
@@ -316,7 +311,6 @@ func NewGenesisBlock(shardID uint64, coinbase *Transaction, difficulty int, gene
 		block.Finalize([]NodeID{genesisProposer}) // Finalized by its own proposer
 		// Ensure the correct genesis VC is set even if ProposeBlock was used
 		block.Header.VectorClock = genesisVC
-		block.Header.Clock = genesisVC
 	}
 
 	log.Printf("Created Genesis Block for Shard %d. Hash: %x... VC: %v", shardID, safeSlice(block.Hash, 4), block.Header.VectorClock)

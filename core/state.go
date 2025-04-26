@@ -1,121 +1,119 @@
 package core
 
 import (
+	"crypto/sha256"
 	"errors"
-	"fmt"
+	"sort"
 	"sync"
 )
 
-// StateDB defines the interface for accessing blockchain state.
-// In a sharded system, each shard would typically have its own StateDB instance.
+// StateDB defines the interface for shard state storage.
 type StateDB interface {
-	Get(key []byte) ([]byte, error)
-	Put(key, value []byte) error
-	Delete(key []byte) error
-	// GetKeys returns all keys in the state DB. Used for migration.
-	// In a real DB (e.g., BadgerDB, LevelDB), this would use iterators.
-	GetKeys() ([][]byte, error)
-	// GetStateRoot calculates a root hash representing the state.
-	// Placeholder for SMT/Patricia Trie integration.
-	GetStateRoot() ([]byte, error)
-	// Size returns the approximate size or number of items.
-	Size() int
-	// Clear deletes all entries (used in merge/cleanup).
+	Get(key string) ([]byte, error)
+	Put(key string, value []byte) error
+	Delete(key string) error
+	GetKeys() ([]string, error) // Return keys as strings
 	Clear() error
+	Size() int                     // Add Size method
+	GetStateRoot() ([]byte, error) // Add GetStateRoot method
 }
 
-// ErrNotFound indicates that a key was not found in the state database.
-var ErrNotFound = errors.New("key not found")
-
-// InMemoryStateDB is a simple thread-safe in-memory implementation of StateDB.
+// InMemoryStateDB provides a simple in-memory implementation of StateDB.
 type InMemoryStateDB struct {
-	mu    sync.RWMutex
-	store map[string][]byte // Use string keys for map efficiency
+	data map[string][]byte
+	mu   sync.RWMutex
 }
 
 // NewInMemoryStateDB creates a new in-memory state database.
 func NewInMemoryStateDB() *InMemoryStateDB {
 	return &InMemoryStateDB{
-		store: make(map[string][]byte),
+		data: make(map[string][]byte),
 	}
 }
 
 // Get retrieves a value by key.
-func (db *InMemoryStateDB) Get(key []byte) ([]byte, error) {
+func (db *InMemoryStateDB) Get(key string) ([]byte, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	value, ok := db.store[string(key)]
+	value, ok := db.data[key]
 	if !ok {
-		return nil, ErrNotFound
+		return nil, errors.New("key not found")
 	}
-	// Return a copy to prevent modification of the underlying map slice
+	// Return a copy to prevent external modification
 	valueCopy := make([]byte, len(value))
 	copy(valueCopy, value)
 	return valueCopy, nil
 }
 
 // Put stores a key-value pair.
-func (db *InMemoryStateDB) Put(key, value []byte) error {
+func (db *InMemoryStateDB) Put(key string, value []byte) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	// Store copies to ensure immutability outside the DB
-	keyCopy := string(key)
+	// Store a copy to prevent external modification
 	valueCopy := make([]byte, len(value))
 	copy(valueCopy, value)
-	db.store[keyCopy] = valueCopy
+	db.data[key] = valueCopy
 	return nil
 }
 
 // Delete removes a key-value pair.
-func (db *InMemoryStateDB) Delete(key []byte) error {
+func (db *InMemoryStateDB) Delete(key string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	keyString := string(key)
-	if _, ok := db.store[keyString]; !ok {
-		return ErrNotFound // Or return nil if deleting non-existent key is okay
+	if _, ok := db.data[key]; !ok {
+		return errors.New("key not found")
 	}
-	delete(db.store, keyString)
+	delete(db.data, key)
 	return nil
 }
 
-// GetKeys returns all keys in the state DB.
-func (db *InMemoryStateDB) GetKeys() ([][]byte, error) {
+// GetKeys returns all keys in the database.
+func (db *InMemoryStateDB) GetKeys() ([]string, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	keys := make([][]byte, 0, len(db.store))
-	for k := range db.store {
-		keyCopy := []byte(k)
-		keys = append(keys, keyCopy)
+	keys := make([]string, 0, len(db.data))
+	for k := range db.data {
+		keys = append(keys, k)
 	}
+	sort.Strings(keys) // Ensure consistent order for state root calculation
 	return keys, nil
 }
 
-// GetStateRoot provides a placeholder state root calculation.
-// TODO: Replace with actual SMT or Patricia Merkle Trie root calculation.
-func (db *InMemoryStateDB) GetStateRoot() ([]byte, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	// Extremely basic placeholder: hash of concatenated key-value pairs (sorted)
-	// This is NOT cryptographically secure or efficient like a proper Merkle Trie/SMT.
-	// Consider using a library like go-ethereum's trie package or a dedicated SMT lib.
-	if len(db.store) == 0 {
-		return EmptyMerkleRoot(), nil // Use the same empty root as transactions
-	}
-	// For a placeholder, maybe just return a hash of the number of items.
-	// This is NOT a real state root.
-	sizeBytes := []byte(fmt.Sprintf("%d", len(db.store)))
-	return SimpleHash(sizeBytes), nil
-}
-
-func (db *InMemoryStateDB) Size() int {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	return len(db.store)
-}
-
+// Clear removes all entries from the database.
 func (db *InMemoryStateDB) Clear() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	db.store = make(map[string][]byte) // Re-initialize the map
+	db.data = make(map[string][]byte) // Reinitialize the map
 	return nil
+}
+
+// Size returns the number of key-value pairs in the database.
+func (db *InMemoryStateDB) Size() int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return len(db.data)
+}
+
+// GetStateRoot calculates a simple hash of all key-value pairs as the state root.
+// NOTE: This is a basic implementation. A real blockchain would use a Merkle tree or similar structure.
+func (db *InMemoryStateDB) GetStateRoot() ([]byte, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if len(db.data) == 0 {
+		// Return a predefined hash for an empty state or nil
+		return sha256.New().Sum(nil), nil
+	}
+
+	// Get keys and sort them for deterministic hashing
+	keys, _ := db.GetKeys() // Already sorted by GetKeys
+
+	hasher := sha256.New()
+	for _, key := range keys {
+		value := db.data[key] // Access directly as we hold the lock
+		hasher.Write([]byte(key))
+		hasher.Write(value)
+	}
+
+	return hasher.Sum(nil), nil
 }
