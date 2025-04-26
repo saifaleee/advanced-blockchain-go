@@ -32,6 +32,9 @@ func NewValidatorManager() *ValidatorManager {
 
 // AddValidator adds a node to the validator set.
 func (vm *ValidatorManager) AddValidator(node *Node, initialReputation int64) error {
+	if node == nil {
+		return fmt.Errorf("cannot add nil node as validator")
+	}
 	vm.mu.Lock()
 	defer vm.mu.Unlock()
 
@@ -77,7 +80,8 @@ func (vm *ValidatorManager) GetActiveValidatorsForShard(shardID uint64) []*Valid
 
 	eligibleValidators := make([]*Validator, 0, len(vm.validators))
 	for _, v := range vm.validators {
-		if v.IsActive.Load() && v.Node.IsAuthenticated.Load() && v.Reputation.Load() >= minReputationToParticipate {
+		// Ensure node is not nil before accessing fields
+		if v.Node != nil && v.IsActive.Load() && v.Node.IsAuthenticated.Load() && v.Reputation.Load() >= minReputationToParticipate {
 			eligibleValidators = append(eligibleValidators, v)
 		} else {
 			// log.Printf("Validator %s skipped for shard %d consensus (Active: %v, Auth: %v, Rep: %d)",
@@ -92,10 +96,26 @@ func (vm *ValidatorManager) GetActiveValidatorsForShard(shardID uint64) []*Valid
 // Modify function signature:
 func (vm *ValidatorManager) SimulateDBFT(
 	proposedBlock *Block,
-	proposer *Validator,
+	proposer *Validator, // Proposer info (can be temporary if node not in manager)
 	level ConsistencyLevel, // <<< ADDED parameter
 	co *ConsistencyOrchestrator, // <<< ADDED parameter
 ) (bool, []NodeID) {
+
+	// Basic nil checks
+	if proposedBlock == nil || proposedBlock.Header == nil {
+		log.Printf("Error: SimulateDBFT called with nil block or header.")
+		return false, nil
+	}
+	if proposer == nil || proposer.Node == nil {
+		log.Printf("Error: SimulateDBFT called with nil proposer or proposer node.")
+		// Cannot penalize proposer if info is missing
+		return false, nil
+	}
+	if co == nil || co.telemetry == nil {
+		log.Printf("Error: SimulateDBFT called with nil ConsistencyOrchestrator or Telemetry.")
+		// Cannot get adaptive timeout or conditions, proceed with defaults? Or fail? Fail safer.
+		return false, nil
+	}
 
 	shardID := proposedBlock.Header.ShardID
 	log.Printf("Shard %d: Starting simulated dBFT (%s) for block H:%d proposed by %s",
@@ -106,20 +126,19 @@ func (vm *ValidatorManager) SimulateDBFT(
 	// Here, we just calculate and log it.
 	baseTimeout := 5 * time.Second // Example base timeout for dBFT round
 	adaptiveTimeout := co.GetAdaptiveTimeout(baseTimeout)
+	currentConditions := co.telemetry.GetCurrentConditions() // Get conditions once
 	log.Printf("Shard %d: Using adaptive dBFT timeout: %v (based on Level: %s, Latency: %dms)",
-		shardID, adaptiveTimeout, level, co.telemetry.GetCurrentConditions().AverageLatencyMs)
+		shardID, adaptiveTimeout, level, currentConditions.AverageLatencyMs)
 	// --- End Adaptive Timeout ---
 
 	validators := vm.GetActiveValidatorsForShard(shardID)
 	if len(validators) == 0 {
 		log.Printf("Shard %d: dBFT failed - No eligible validators found.", shardID)
-		if proposer != nil && proposer.Node != nil { // Check proposer validity
-			// Check if proposer exists in manager before updating rep
-			if actualProposer, exists := vm.GetValidator(proposer.Node.ID); exists {
-				actualProposer.UpdateReputation(DbftConsensusPenalty) // Penalize proposer
-			} else {
-				log.Printf("Warning: Proposer %s not found in manager during penalty application.", proposer.Node.ID)
-			}
+		// Penalize the proposer if they exist in the manager
+		if actualProposer, exists := vm.GetValidator(proposer.Node.ID); exists {
+			actualProposer.UpdateReputation(DbftConsensusPenalty) // Penalize proposer
+		} else {
+			log.Printf("Warning: Proposer %s not found in manager during penalty application (no validators).", proposer.Node.ID)
 		}
 		return false, nil
 	}
@@ -147,6 +166,11 @@ func (vm *ValidatorManager) SimulateDBFT(
 	// In reality, you'd collect votes within the 'adaptiveTimeout' duration.
 	// The core validation logic remains the same for this simulation.
 	for _, v := range validators {
+		// Ensure validator node is not nil
+		if v.Node == nil {
+			log.Printf("Warning: Skipping validator with nil Node during voting.")
+			continue
+		}
 		isValid := pow.Validate() // Simple validation check
 		// TODO: Add state root validation, transaction validation etc.
 
@@ -164,17 +188,16 @@ func (vm *ValidatorManager) SimulateDBFT(
 		log.Printf("Shard %d: dBFT Consensus REACHED for Block H:%d (%d/%d votes >= %d required)",
 			shardID, proposedBlock.Header.Height, agreementVotes, len(validators), requiredVotes)
 
-		// Reward proposer (if they exist in the manager)
-		if proposer != nil && proposer.Node != nil {
-			if actualProposer, exists := vm.GetValidator(proposer.Node.ID); exists {
-				actualProposer.UpdateReputation(DbftConsensusReward)
-			}
-		}
+		// Reward proposer (only if they are a registered validator in the manager)
+		if actualProposer, exists := vm.GetValidator(proposer.Node.ID); exists {
+			actualProposer.UpdateReputation(DbftConsensusReward)
+		} // No reward/penalty if proposer wasn't in the manager
+
 		// Reward agreeing validators
 		for _, agreeID := range agreeingValidators {
 			if val, ok := vm.GetValidator(agreeID); ok {
-				// Avoid double reward if proposer also voted yes
-				if proposer == nil || proposer.Node == nil || val.Node.ID != proposer.Node.ID {
+				// Avoid double reward if proposer also voted yes AND was a registered validator
+				if val.Node.ID != proposer.Node.ID || !vm.isRegisteredValidator(proposer.Node.ID) {
 					val.UpdateReputation(DbftConsensusReward)
 				}
 			}
@@ -186,14 +209,20 @@ func (vm *ValidatorManager) SimulateDBFT(
 	log.Printf("Shard %d: dBFT Consensus FAILED (%s) for Block H:%d (%d/%d votes < %d required)",
 		shardID, level, proposedBlock.Header.Height, agreementVotes, len(validators), requiredVotes) // Log level
 
-	// Penalize proposer ONLY if consensus failed
-	if proposer != nil && proposer.Node != nil {
-		if actualProposer, exists := vm.GetValidator(proposer.Node.ID); exists {
-			actualProposer.UpdateReputation(DbftConsensusPenalty) // Penalize proposer
-		} else {
-			log.Printf("Warning: Proposer %s not found in manager during consensus failure penalty application.", proposer.Node.ID)
-		}
+	// Penalize proposer ONLY if consensus failed (and if they are a registered validator)
+	if actualProposer, exists := vm.GetValidator(proposer.Node.ID); exists {
+		actualProposer.UpdateReputation(DbftConsensusPenalty) // Penalize proposer
+	} else {
+		log.Printf("Warning: Proposer %s not found in manager during consensus failure penalty application.", proposer.Node.ID)
 	}
 
 	return false, nil
+}
+
+// isRegisteredValidator is a helper to check if a node ID exists in the manager (read-locked).
+func (vm *ValidatorManager) isRegisteredValidator(id NodeID) bool {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	_, exists := vm.validators[id]
+	return exists
 }

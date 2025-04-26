@@ -289,7 +289,8 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 	}
 
 	// --- 4. Propose Block (PoW) ---
-	proposedBlock, err := ProposeBlock(shardID, transactionsForProposal, prevBlock.Hash, newHeight, stateRoot, bc.Difficulty, proposerNodeID)
+	// Pass previous block's Vector Clock to ProposeBlock
+	proposedBlock, err := ProposeBlock(shardID, transactionsForProposal, prevBlock.Hash, newHeight, stateRoot, bc.Difficulty, proposerNodeID, prevBlock.Header.VectorClock)
 	if err != nil {
 		log.Printf("Shard %d: Failed to propose block H:%d: %v", shardID, newHeight, err)
 		// If proposing fails (e.g., PoW timeout), need to decide how to handle txs.
@@ -324,7 +325,7 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 	// --- 6. Mark Block as Final & Validate ---
 	proposedBlock.Finalize(agreeingValidators)
 
-	// Perform final validation checks (including new fields)
+	// Perform final validation checks (including new fields and Vector Clock)
 	if !ValidateBlockIntegrity(proposedBlock, prevBlock, bc.ValidatorMgr) { // Pass ValidatorMgr
 		log.Printf("Shard %d: CRITICAL - Finalized block H:%d failed integrity validation!", shardID, newHeight)
 		// This should ideally not happen if dBFT simulation was correct, but check anyway.
@@ -332,10 +333,7 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 		return nil, fmt.Errorf("finalized block %d failed integrity check", newHeight)
 	}
 	// PoW validation was implicitly checked during dBFT simulation, but can re-check.
-	// powCheck := NewProofOfWork(proposedBlock)
-	// if !powCheck.Validate() {
-	//  return nil, fmt.Errorf("finalized block %d failed PoW check", newHeight)
-	// }
+	// ... (PoW re-check remains the same) ...
 
 	// --- 7. Add Finalized Block to Chain ---
 	bc.ChainMu.Lock()
@@ -353,8 +351,22 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 	// Update shard metrics (e.g., block count)
 	shard.Metrics.BlockCount.Add(1)
 
-	log.Printf("Shard %d: ===> Successfully Proposed, Finalized, and Added Block H:%d. Hash: %x... <===",
-		shardID, newHeight, safeSlice(proposedBlock.Hash, 4))
+	// --- Ticket 5: Placeholder for Conflict Detection/Resolution ---
+	// Entropy Check (Placeholder)
+	// entropyLevel := shard.CalculateStateEntropy() // Hypothetical function
+	// if entropyLevel > threshold {
+	//  log.Printf("Shard %d: High state entropy detected (%f). Potential conflicts.", shardID, entropyLevel)
+	// }
+
+	// VRF-based Resolution (Placeholder)
+	// if potentialConflictDetected {
+	//  winningVersion := ResolveConflictWithVRF(conflictingKeys)
+	//  // Apply winning version state changes
+	// }
+	// -------------------------------------------------------------
+
+	log.Printf("Shard %d: ===> Successfully Proposed, Finalized, and Added Block H:%d. Hash: %x... VC: %v <===",
+		shardID, newHeight, safeSlice(proposedBlock.Hash, 4), proposedBlock.Header.VectorClock)
 
 	return proposedBlock, nil
 }
@@ -414,7 +426,7 @@ func (bc *Blockchain) GetBlock(hash []byte) (*Block, error) {
 	return nil, fmt.Errorf("block with hash %x not found in any shard", hash)
 }
 
-// ValidateBlockIntegrity includes checks for proposer and finality (basic checks).
+// ValidateBlockIntegrity includes checks for proposer, finality, and vector clock causality.
 func ValidateBlockIntegrity(newBlock, prevBlock *Block, vm *ValidatorManager) bool {
 	if newBlock == nil || prevBlock == nil {
 		log.Println("Validation Error: Cannot validate nil blocks.")
@@ -459,13 +471,43 @@ func ValidateBlockIntegrity(newBlock, prevBlock *Block, vm *ValidatorManager) bo
 		log.Printf("Validation Error: Shard %d Block %d (non-genesis) has no finality signatures.", newBlock.Header.ShardID, newBlock.Header.Height)
 		return false
 	}
-	// Could add check for minimum number of signatures, matching against active validators etc.
+
+	// --- Ticket 5: Vector Clock Causality Check ---
+	comparison := newBlock.Header.VectorClock.Compare(prevBlock.Header.VectorClock)
+	// The new block's clock must happen after or be concurrent (only if identical, which shouldn't happen if incremented)
+	// It must strictly dominate the previous block's clock in its own shard entry.
+	if comparison == -1 { // newBlock.VC < prevBlock.VC (Invalid - time went backwards)
+		log.Printf("Validation Error: Shard %d Block %d VectorClock (%v) is causally BEFORE previous block (%v).",
+			newBlock.Header.ShardID, newBlock.Header.Height, newBlock.Header.VectorClock, prevBlock.Header.VectorClock)
+		return false
+	}
+	// Check that the current shard's entry was incremented
+	newShardEntry := newBlock.Header.VectorClock[newBlock.Header.ShardID]
+	prevShardEntry := prevBlock.Header.VectorClock[prevBlock.Header.ShardID] // Can be 0 if key didn't exist
+	if newShardEntry != prevShardEntry+1 {
+		log.Printf("Validation Error: Shard %d Block %d VectorClock entry for shard %d (%d) was not incremented correctly from previous block (%d).",
+			newBlock.Header.ShardID, newBlock.Header.Height, newBlock.Header.ShardID, newShardEntry, prevShardEntry)
+		return false
+	}
+	// Optional: Check that other shard entries are >= previous block's entries
+	for shardID, prevVal := range prevBlock.Header.VectorClock {
+		if shardID == newBlock.Header.ShardID {
+			continue // Already checked increment
+		}
+		newVal, ok := newBlock.Header.VectorClock[shardID]
+		if !ok || newVal < prevVal { // New clock must have at least the knowledge of the previous one
+			log.Printf("Validation Error: Shard %d Block %d VectorClock entry for other shard %d (%d) is less than previous block's entry (%d).",
+				newBlock.Header.ShardID, newBlock.Header.Height, shardID, newVal, prevVal)
+			return false
+		}
+	}
+	// ---------------------------------------------------
 
 	// log.Printf("Shard %d: Block %d integrity validated successfully against Block %d.", newBlock.Header.ShardID, newBlock.Header.Height, prevBlock.Header.Height)
 	return true
 }
 
-// IsChainValid now includes PoW, integrity, proposer, and finality checks.
+// IsChainValid now includes PoW, integrity, proposer, finality, and vector clock checks.
 func (bc *Blockchain) IsChainValid() bool {
 	bc.ChainMu.RLock()
 	defer bc.ChainMu.RUnlock()
@@ -506,6 +548,11 @@ func (bc *Blockchain) IsChainValid() bool {
 				errorChan <- fmt.Errorf("shard %d genesis block has no finality signatures", sID)
 				return
 			}
+			// Genesis Vector Clock check (should have entry 1 for its own shard)
+			if genesis.Header.VectorClock == nil || genesis.Header.VectorClock[sID] != 1 {
+				errorChan <- fmt.Errorf("shard %d genesis block has invalid vector clock: %v", sID, genesis.Header.VectorClock)
+				return
+			}
 
 			if len(ch) == 1 {
 				return // Only genesis, already checked
@@ -523,8 +570,8 @@ func (bc *Blockchain) IsChainValid() bool {
 					return
 				}
 
-				// Check Integrity (includes proposer/finality checks)
-				if !ValidateBlockIntegrity(currentBlock, prevBlock, vm) { // Pass vm
+				// Check Integrity (includes proposer/finality/VC checks)
+				if !ValidateBlockIntegrity(currentBlock, prevBlock, vm) {
 					// Specific error logged within ValidateBlockIntegrity
 					errorChan <- fmt.Errorf("shard %d integrity validation failed between Block H:%d and H:%d", sID, prevBlock.Header.Height, currentBlock.Header.Height)
 					return

@@ -8,9 +8,6 @@ import (
 	"sync/atomic"
 )
 
-// NodeID represents a unique identifier for a node.
-type NodeID string
-
 // GenerateNodeID creates a random NodeID.
 func GenerateNodeID() NodeID {
 	bytes := make([]byte, 16) // 128 bits

@@ -13,8 +13,6 @@ import (
 	"github.com/willf/bloom" // Import Bloom filter
 )
 
-// *** REMOVED CONST: powTargetBits - Difficulty now comes from BlockHeader ***
-
 // BlockHeader represents the header part of a block.
 type BlockHeader struct {
 	ShardID       uint64
@@ -31,6 +29,12 @@ type BlockHeader struct {
 	ProposerID         NodeID   // ID of the node that proposed this block via PoW
 	FinalitySignatures []NodeID // List of Validator IDs that finalized this block (simulated)
 	// In a real system, FinalitySignatures would be actual crypto signatures
+
+	// --- Ticket 5: Conflict Resolution ---
+	VectorClock VectorClock // Tracks causal history of the block
+
+	// --- Suggested Change ---
+	Clock VectorClock // Vector clock representing state after this block
 }
 
 // Block represents a block in the blockchain.
@@ -68,8 +72,18 @@ func (pow *ProofOfWork) Target() *big.Int {
 // prepareData prepares the data to be hashed for PoW.
 // It includes fields from the header EXCEPT the Nonce, Hash, and FinalitySignatures.
 // ProposerID IS included in the hash calculation.
+// VectorClock IS included in the hash calculation.
 func (pow *ProofOfWork) prepareData(nonce int64) []byte {
 	header := pow.block.Header
+	// Serialize VectorClock for hashing
+	vcBytes, err := header.VectorClock.Serialize() // Assuming a Serialize method exists
+	if err != nil {
+		log.Printf("CRITICAL: Failed to serialize vector clock for hashing block %d: %v", header.Height, err)
+		// Handle error appropriately - maybe return an error or use a placeholder?
+		// Using empty bytes for now, but this is not ideal.
+		vcBytes = []byte{}
+	}
+
 	data := bytes.Join(
 		[][]byte{
 			header.PrevBlockHash,
@@ -81,6 +95,7 @@ func (pow *ProofOfWork) prepareData(nonce int64) []byte {
 			[]byte(fmt.Sprintf("%d", header.Difficulty)),
 			header.BloomFilter,               // Include Bloom filter data
 			[]byte(header.ProposerID),        // Include Proposer ID in hash
+			vcBytes,                          // Include serialized Vector Clock
 			[]byte(fmt.Sprintf("%d", nonce)), // Include the nonce being tried
 			// DO NOT INCLUDE FinalitySignatures here
 		},
@@ -148,7 +163,8 @@ func (pow *ProofOfWork) Validate() bool {
 
 // ProposeBlock creates a new block proposal via PoW, but doesn't finalize it.
 // It performs PoW and sets the Nonce and Hash.
-func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []byte, height uint64, stateRoot []byte, difficulty int, proposerID NodeID) (*Block, error) {
+// Now also calculates and sets the block's VectorClock.
+func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []byte, height uint64, stateRoot []byte, difficulty int, proposerID NodeID, prevBlockVC VectorClock) (*Block, error) { // Added prevBlockVC
 	if proposerID == "" {
 		return nil, fmt.Errorf("proposer ID cannot be empty")
 	}
@@ -161,13 +177,28 @@ func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []b
 		Difficulty:    difficulty,
 		StateRoot:     stateRoot,
 		ProposerID:    proposerID, // Set proposer ID
+		// VectorClock will be calculated below
 		// Nonce, BloomFilter, Hash, FinalitySignatures will be set below or later
+		Clock: prevBlockVC.Copy(), // Initialize with a copy of previous block's clock
 	}
 
 	block := &Block{
 		Header:       header,
 		Transactions: transactions,
 	}
+
+	// --- Calculate Block Vector Clock --- (Ticket 5)
+	// Start with a copy of the previous block's clock
+	blockVC := prevBlockVC.Copy()
+	// Merge clocks from all included transactions
+	for _, tx := range transactions {
+		// Merge assuming tx.VectorClock is now the correct map[uint64]uint64 type
+		blockVC.Merge(tx.VectorClock)
+	}
+	// Increment the clock for the current shard
+	blockVC[shardID]++
+	block.Header.VectorClock = blockVC
+	// -----------------------------------
 
 	// Calculate Merkle Root
 	txHashes := make([][]byte, len(transactions))
@@ -208,7 +239,7 @@ func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []b
 	block.Header.Nonce = nonce
 	block.Hash = hash // Store the hash resulting from PoW
 
-	log.Printf("Shard %d: Proposed Block H:%d by %s. Hash: %x...", shardID, height, proposerID, safeSlice(hash, 4))
+	log.Printf("Shard %d: Proposed Block H:%d by %s. Hash: %x... VC: %v", shardID, height, proposerID, safeSlice(hash, 4), block.Header.VectorClock)
 
 	return block, nil
 }
@@ -231,6 +262,10 @@ func NewGenesisBlock(shardID uint64, coinbase *Transaction, difficulty int, gene
 	// State root is initially empty.
 	emptyStateRoot := []byte{}
 
+	// Genesis Vector Clock: Starts at 1 for its own shard, 0 otherwise
+	genesisVC := make(VectorClock)
+	genesisVC[shardID] = 1
+
 	// Use ProposeBlock to get PoW done (even if difficulty is low for genesis)
 	// It's simpler to reuse the logic. Genesis difficulty can be set low.
 	genesisProposer := genesisProposerID
@@ -239,7 +274,8 @@ func NewGenesisBlock(shardID uint64, coinbase *Transaction, difficulty int, gene
 	}
 
 	// Attempt to propose with potentially very low difficulty
-	block, err := ProposeBlock(shardID, []*Transaction{coinbase}, []byte{}, 0, emptyStateRoot, difficulty, genesisProposer)
+	// Pass an empty VectorClock as the 'previous' clock for genesis
+	block, err := ProposeBlock(shardID, []*Transaction{coinbase}, []byte{}, 0, emptyStateRoot, difficulty, genesisProposer, make(VectorClock))
 
 	if err != nil {
 		// Fallback if ProposeBlock fails (e.g., extreme difficulty setting)
@@ -256,6 +292,8 @@ func NewGenesisBlock(shardID uint64, coinbase *Transaction, difficulty int, gene
 			BloomFilter:        []byte{},
 			ProposerID:         genesisProposer,
 			FinalitySignatures: []NodeID{"GENESIS"}, // Mark as finalized by "GENESIS"
+			VectorClock:        genesisVC,           // Set fallback VC
+			Clock:              genesisVC,           // Set fallback Clock
 		}
 		block = &Block{
 			Header:       header,
@@ -276,9 +314,12 @@ func NewGenesisBlock(shardID uint64, coinbase *Transaction, difficulty int, gene
 	} else {
 		// Mark the proposed genesis block as finalized immediately
 		block.Finalize([]NodeID{genesisProposer}) // Finalized by its own proposer
+		// Ensure the correct genesis VC is set even if ProposeBlock was used
+		block.Header.VectorClock = genesisVC
+		block.Header.Clock = genesisVC
 	}
 
-	log.Printf("Created Genesis Block for Shard %d. Hash: %x...", shardID, safeSlice(block.Hash, 4))
+	log.Printf("Created Genesis Block for Shard %d. Hash: %x... VC: %v", shardID, safeSlice(block.Hash, 4), block.Header.VectorClock)
 	return block
 }
 

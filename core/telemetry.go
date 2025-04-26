@@ -71,6 +71,7 @@ func (m *NetworkTelemetryMonitor) Stop() {
 		// Already closed or closing
 		return
 	default:
+		// Only close if not already closed
 		close(m.stopChan)
 	}
 	m.monitorWg.Wait()
@@ -113,7 +114,7 @@ func (m *NetworkTelemetryMonitor) GetCurrentConditions() *NetworkConditions {
 	if !ok || conditions == nil {
 		// This should ideally not happen if initialized correctly
 		log.Println("Error: Failed to load network conditions, returning default.")
-		// Return a default non-nil value
+		// Return a default non-nil value to prevent nil pointer errors downstream
 		return &NetworkConditions{AverageLatencyMs: 100, PartitionDetected: false, PacketLossPercent: 1.0}
 	}
 	return conditions
