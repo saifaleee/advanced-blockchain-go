@@ -5,6 +5,7 @@ import (
 	"log"
 	"math"
 	"sync"
+	"time"
 )
 
 const (
@@ -88,10 +89,26 @@ func (vm *ValidatorManager) GetActiveValidatorsForShard(shardID uint64) []*Valid
 
 // SimulateDBFT performs a simulated dBFT consensus round for a proposed block.
 // Returns true if consensus is reached, and the list of agreeing validator IDs.
-func (vm *ValidatorManager) SimulateDBFT(proposedBlock *Block, proposer *Validator) (bool, []NodeID) {
+// Modify function signature:
+func (vm *ValidatorManager) SimulateDBFT(
+	proposedBlock *Block,
+	proposer *Validator,
+	level ConsistencyLevel, // <<< ADDED parameter
+	co *ConsistencyOrchestrator, // <<< ADDED parameter
+) (bool, []NodeID) {
+
 	shardID := proposedBlock.Header.ShardID
-	log.Printf("Shard %d: Starting simulated dBFT for block H:%d proposed by %s",
-		shardID, proposedBlock.Header.Height, proposer.Node.ID) // Use proposer.Node.ID safely
+	log.Printf("Shard %d: Starting simulated dBFT (%s) for block H:%d proposed by %s",
+		shardID, level, proposedBlock.Header.Height, proposer.Node.ID) // Log level
+
+	// --- Adaptive Timeout (Conceptual) ---
+	// In a real network scenario, you'd use this timeout for communication rounds.
+	// Here, we just calculate and log it.
+	baseTimeout := 5 * time.Second // Example base timeout for dBFT round
+	adaptiveTimeout := co.GetAdaptiveTimeout(baseTimeout)
+	log.Printf("Shard %d: Using adaptive dBFT timeout: %v (based on Level: %s, Latency: %dms)",
+		shardID, adaptiveTimeout, level, co.telemetry.GetCurrentConditions().AverageLatencyMs)
+	// --- End Adaptive Timeout ---
 
 	validators := vm.GetActiveValidatorsForShard(shardID)
 	if len(validators) == 0 {
@@ -107,29 +124,41 @@ func (vm *ValidatorManager) SimulateDBFT(proposedBlock *Block, proposer *Validat
 		return false, nil
 	}
 
+	// --- Adaptive Threshold (Example) ---
+	// We could potentially relax the threshold for Eventual consistency,
+	// but this weakens BFT guarantees significantly. Use with extreme caution!
+	// For this PoC, we'll keep the standard threshold but log the possibility.
 	requiredVotes := int(math.Floor(float64(len(validators))*float64(dBFTThresholdNumerator)/float64(dBFTThresholdDenominator))) + 1
+
+	if level == Eventual {
+		// Example: Could potentially lower requiredVotes here, but NOT recommended for BFT.
+		log.Printf("Shard %d: Operating under Eventual consistency. (Standard BFT threshold %d/%d still applied for simulation)",
+			shardID, dBFTThresholdNumerator, dBFTThresholdDenominator)
+	}
+	// --- End Adaptive Threshold ---
+
 	log.Printf("Shard %d: dBFT requires %d votes out of %d eligible validators.", shardID, requiredVotes, len(validators))
 
 	agreementVotes := 0
 	agreeingValidators := make([]NodeID, 0, len(validators))
 	pow := NewProofOfWork(proposedBlock)
 
+	// --- Simulate Voting (with conceptual timeout) ---
+	// In reality, you'd collect votes within the 'adaptiveTimeout' duration.
+	// The core validation logic remains the same for this simulation.
 	for _, v := range validators {
-		// Validate the block proposal (PoW check is the main part here)
-		isValid := pow.Validate()
-		// Add other validation checks here in a real system (state root, tx validity etc.)
+		isValid := pow.Validate() // Simple validation check
+		// TODO: Add state root validation, transaction validation etc.
 
 		if isValid {
 			agreementVotes++
 			agreeingValidators = append(agreeingValidators, v.Node.ID)
-			// log.Printf("Shard %d: Validator %s votes YES (Block H:%d Valid)", shardID, v.Node.ID, proposedBlock.Header.Height)
 		} else {
-			// Validator correctly identifies an invalid block - NO PENALTY for voting NO here.
 			log.Printf("Shard %d: Validator %s votes NO (Block H:%d INVALID PoW/Structure)", shardID, v.Node.ID, proposedBlock.Header.Height)
-			// *** REMOVED PENALTY FOR VOTING NO ***
-			// v.UpdateReputation(DbftConsensusPenalty)
+			// No penalty for voting NO on an invalid block
 		}
 	}
+	// --- End Simulate Voting ---
 
 	if agreementVotes >= requiredVotes {
 		log.Printf("Shard %d: dBFT Consensus REACHED for Block H:%d (%d/%d votes >= %d required)",
@@ -154,8 +183,8 @@ func (vm *ValidatorManager) SimulateDBFT(proposedBlock *Block, proposer *Validat
 	}
 
 	// Consensus failed
-	log.Printf("Shard %d: dBFT Consensus FAILED for Block H:%d (%d/%d votes < %d required)",
-		shardID, proposedBlock.Header.Height, agreementVotes, len(validators), requiredVotes)
+	log.Printf("Shard %d: dBFT Consensus FAILED (%s) for Block H:%d (%d/%d votes < %d required)",
+		shardID, level, proposedBlock.Header.Height, agreementVotes, len(validators), requiredVotes) // Log level
 
 	// Penalize proposer ONLY if consensus failed
 	if proposer != nil && proposer.Node != nil {

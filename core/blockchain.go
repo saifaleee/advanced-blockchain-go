@@ -13,18 +13,19 @@ import (
 // Blockchain now manages multiple shards and includes consensus components.
 type Blockchain struct {
 	ShardManager    *ShardManager
-	ValidatorMgr    *ValidatorManager   // Added Validator Manager
-	Difficulty      int                 // Global PoW difficulty (can be per-shard later)
-	ChainHeight     int                 // Approximate overall chain height (max shard height)
-	Mu              sync.RWMutex        // Protects global state like ChainHeight
-	BlockChains     map[uint64][]*Block // In-memory storage per shard chain
-	ChainMu         sync.RWMutex        // Lock specifically for accessing blockChains map
-	LocalNodeID     NodeID              // ID of the node running this blockchain instance (for proposing)
-	GenesisProposer NodeID              // ID used for genesis blocks
+	ValidatorMgr    *ValidatorManager        // Added Validator Manager
+	Consistency     *ConsistencyOrchestrator // <<< ADDED for Ticket 4
+	Difficulty      int                      // Global PoW difficulty (can be per-shard later)
+	ChainHeight     int                      // Approximate overall chain height (max shard height)
+	Mu              sync.RWMutex             // Protects global state like ChainHeight
+	BlockChains     map[uint64][]*Block      // In-memory storage per shard chain
+	ChainMu         sync.RWMutex             // Lock specifically for accessing blockChains map
+	LocalNodeID     NodeID                   // ID of the node running this blockchain instance (for proposing)
+	GenesisProposer NodeID                   // ID used for genesis blocks
 }
 
 // NewBlockchain creates a new sharded blockchain with consensus mechanisms.
-func NewBlockchain(initialShardCount uint, config ShardManagerConfig, validatorMgr *ValidatorManager, localNodeID NodeID) (*Blockchain, error) {
+func NewBlockchain(initialShardCount uint, config ShardManagerConfig, validatorMgr *ValidatorManager, consistency *ConsistencyOrchestrator, localNodeID NodeID) (*Blockchain, error) {
 	difficulty := 16 // Default difficulty, adjust as needed
 	if difficulty < 1 {
 		return nil, errors.New("difficulty must be at least 1")
@@ -37,27 +38,36 @@ func NewBlockchain(initialShardCount uint, config ShardManagerConfig, validatorM
 		// Assign a default or generate one? For simulation, allow empty but log warning.
 	}
 
-	// Create shard manager with config
+	// Add nil check for consistency orchestrator:
+	if consistency == nil {
+		return nil, errors.New("consistency orchestrator cannot be nil")
+	}
+	if validatorMgr == nil { // Keep existing checks too
+		return nil, errors.New("validator manager cannot be nil")
+	}
+	if localNodeID == "" {
+		log.Println("Warning: Local node ID not set for blockchain instance.")
+	}
+
 	sm, err := NewShardManager(config, int(initialShardCount))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create shard manager: %w", err)
 	}
 
-	// Initialize Blockchain struct
+	// Initialize Blockchain struct - Add Consistency field:
 	bc := &Blockchain{
 		ShardManager:    sm,
-		ValidatorMgr:    validatorMgr, // Store validator manager
+		ValidatorMgr:    validatorMgr,
+		Consistency:     consistency, // <<< ADDED Assignment
 		Difficulty:      difficulty,
 		ChainHeight:     0,
-		BlockChains:     make(map[uint64][]*Block), // Initialize map
+		BlockChains:     make(map[uint64][]*Block),
 		LocalNodeID:     localNodeID,
-		GenesisProposer: NodeID("GENESIS_" + localNodeID), // Unique genesis proposer ID per instance
-		// Mu:           sync.RWMutex{}, // Ensure mutexes are initialized if not implicitly
-		// ChainMu:      sync.RWMutex{},
+		GenesisProposer: NodeID("GENESIS_" + localNodeID),
 	}
 
 	// Link ShardManager back to Blockchain
-	sm.SetBlockchainLink(bc) // Set the link
+	sm.SetBlockchainLink(bc)
 
 	// --- Explicitly manage lock and add checks/logging for genesis creation ---
 	bc.ChainMu.Lock() // Lock before modifying the map
@@ -287,14 +297,28 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 		return nil, fmt.Errorf("block proposal failed for shard %d: %w", shardID, err)
 	}
 
-	// --- 5. Finalize Block (Simulated dBFT) ---
-	consensusReached, agreeingValidators := bc.ValidatorMgr.SimulateDBFT(proposedBlock, proposer)
+	// Inside func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error)
+
+	// ... (after block proposal, before consensus) ...
+
+	// --- 5. Finalize Block (Simulated dBFT with Adaptive Consistency) ---
+	currentConsistencyLevel := bc.Consistency.GetCurrentLevel() // <<< GET Current Level
+	log.Printf("Shard %d: Running consensus with %s consistency level.", shardID, currentConsistencyLevel)
+
+	// Modify the SimulateDBFT call:
+	consensusReached, agreeingValidators := bc.ValidatorMgr.SimulateDBFT(
+		proposedBlock,
+		proposer,
+		currentConsistencyLevel, // <<< PASS Level
+		bc.Consistency,          // <<< PASS Orchestrator (for timeouts etc.)
+	)
 
 	if !consensusReached {
-		log.Printf("Shard %d: Consensus failed for proposed block H:%d. Discarding block.", shardID, newHeight)
+		log.Printf("Shard %d: Consensus failed for proposed block H:%d under %s consistency. Discarding block.",
+			shardID, newHeight, currentConsistencyLevel) // Log level
 		// TODO: Handle transactions from failed block (e.g., return to pool)
 		// For now, they are effectively dropped.
-		return nil, errors.New("dBFT consensus failed")
+		return nil, fmt.Errorf("dBFT consensus failed (%s level)", currentConsistencyLevel) // Include level in error
 	}
 
 	// --- 6. Mark Block as Final & Validate ---

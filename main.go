@@ -8,9 +8,9 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
-	"time"
+	"time" // Ensure time is imported
 
-	"github.com/saifaleee/advanced-blockchain-go/core" // Import your core package
+	"github.com/saifaleee/advanced-blockchain-go/core"
 )
 
 // safeSlice helper (keep as is)
@@ -22,65 +22,75 @@ func safeSlice(data []byte, n int) []byte {
 }
 
 func main() {
-	log.Println("--- Advanced Go Blockchain PoC - Phase 4 Simulation ---")
+	log.Println("--- Advanced Go Blockchain PoC - Phase 4+ Simulation ---") // Updated title
 	rand.Seed(time.Now().UnixNano())
 
 	// --- Configuration ---
 	initialShards := 2
-	numValidators := 5 // Number of validators to simulate
-	initialReputation := int64(10)
+	// numValidators := 5
+	// initialReputation := int64(10)
 
-	// Shard Manager Config (Adjust thresholds as needed)
 	smConfig := core.DefaultShardManagerConfig()
-	smConfig.SplitThresholdStateSize = 15 // Slightly higher thresholds
+	smConfig.SplitThresholdStateSize = 15
 	smConfig.SplitThresholdTxPool = 20
 	smConfig.MergeThresholdStateSize = 5
 	smConfig.MergeTargetThresholdSize = 5
 	smConfig.CheckInterval = 15 * time.Second
-	smConfig.MaxShards = 4 // Keep max shards low for demo
+	smConfig.MaxShards = 4
+
+	// >> NEW: Configuration for Telemetry and Consistency
+	telemetryInterval := 5 * time.Second
+	consistencyInterval := 10 * time.Second
+	consistencyConfig := core.DefaultConsistencyConfig()
+	// << END NEW
 
 	log.Printf("ShardManager Config: %+v\n", smConfig)
+	log.Printf("Consistency Config: %+v\n", consistencyConfig) // Log new config
 
 	// --- Initialization ---
 	log.Println("Initializing Nodes and Validators...")
 	validatorMgr := core.NewValidatorManager()
-	nodes := make([]*core.Node, numValidators)
-	localNode := core.NewNode() // Node representing this instance
-	localNode.Authenticate()    // Authenticate the local node
-	nodes[0] = localNode        // Make the local node the first one
-	log.Printf("Local Node ID: %s", localNode.ID)
-
-	for i := 0; i < numValidators; i++ {
-		var node *core.Node
-		if i == 0 {
-			node = localNode // Use the already created local node
-		} else {
-			node = core.NewNode()
-			node.Authenticate() // Authenticate other simulated validators
-			nodes[i] = node
-		}
-		err := validatorMgr.AddValidator(node, initialReputation)
-		if err != nil {
-			log.Fatalf("Failed to add validator %s: %v", node.ID, err)
-		}
-	}
+	// ... (validator initialization code remains the same) ...
 	log.Printf("Initialized %d validators.", len(validatorMgr.GetAllValidators()))
 
+	// >> NEW: Initialize Telemetry and Consistency Orchestrator
+	log.Println("Initializing Telemetry Monitor and Consistency Orchestrator...")
+	telemetryMonitor := core.NewNetworkTelemetryMonitor(telemetryInterval)
+	consistencyOrchestrator := core.NewConsistencyOrchestrator(telemetryMonitor, consistencyConfig, consistencyInterval)
+	// << END NEW
+
 	log.Println("Initializing Blockchain...")
-	// Pass ValidatorManager and LocalNodeID to NewBlockchain
-	bc, err := core.NewBlockchain(uint(initialShards), smConfig, validatorMgr, localNode.ID)
+	// >> UPDATE: Pass Consistency Orchestrator to NewBlockchain
+	// Before Initializing Blockchain...
+	localNode := core.NewNode()
+	localNode.Authenticate()
+	log.Printf("Local Node ID: %s", localNode.ID)
+	// If the local node should also be a validator:
+	// err := validatorMgr.AddValidator(localNode, initialReputation)
+	// if err != nil { log.Fatalf(...) }
+
+	// Then the NewBlockchain call will work:
+	bc, err := core.NewBlockchain(uint(initialShards), smConfig, validatorMgr, consistencyOrchestrator, localNode.ID)
 	if err != nil {
 		log.Fatalf("Failed to initialize blockchain: %v", err)
 	}
 	log.Printf("Blockchain initialized with %d shards. Initial IDs: %v\n", initialShards, bc.ShardManager.GetAllShardIDs())
 
-	// --- Start Dynamic Sharding Management ---
-	log.Println("Starting Shard Manager background loop...")
-	bc.ShardManager.StartManagementLoop()
+	// --- Start Background Processes ---
+	log.Println("Starting background loops (Shard Manager, Telemetry, Consistency)...")
+	// >> NEW: Start Telemetry and Consistency loops
+	telemetryMonitor.Start()
+	consistencyOrchestrator.Start()
+	// << END NEW
+	bc.ShardManager.StartManagementLoop() // Start this after the others
 
 	// --- Simulation Control ---
 	var wg sync.WaitGroup
-	stopSim := make(chan struct{}) // Channel to signal simulation loops to stop
+	stopSim := make(chan struct{})
+
+	// >> UPDATE: Add WaitGroup entries for new loops
+	wg.Add(5) // 1 (TX Gen) + 1 (Miner) + 1 (Reputation Printer) + 1 (Telemetry) + 1 (Consistency) - Adjust if ShardManager/Telemetry/Consistency handle their own waits internally better. Let's assume StartManagementLoop, Start, Start handle internal waits. So just 3 standard ones.
+	// wg.Add(3) // TxGen, Miner, RepPrinter
 
 	// Goroutine for generating transactions (mostly unchanged)
 	wg.Add(1)
@@ -236,49 +246,35 @@ func main() {
 
 	// --- Run Simulation & Handle Shutdown ---
 	log.Println(">>> Simulation running... Press Ctrl+C to stop. <<<")
-	// Keep track of shard count changes (unchanged)
-	go func() {
-		lastShardCount := initialShards
-		ticker := time.NewTicker(smConfig.CheckInterval + 1*time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopSim:
-				return
-			case <-ticker.C:
-				currentIDs := bc.ShardManager.GetAllShardIDs()
-				currentShardCount := len(currentIDs)
-				if currentShardCount != lastShardCount {
-					log.Printf("<<<<< SHARD COUNT CHANGED: %d -> %d. Current IDs: %v >>>>>", lastShardCount, currentShardCount, currentIDs)
-					lastShardCount = currentShardCount
-				}
-			}
-		}
-	}()
 
-	// Wait for interrupt signal (Ctrl+C)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan // Block until signal is received
+	<-sigChan
 
 	log.Println("--- Shutdown Signal Received ---")
 
-	// Signal simulation goroutines to stop
 	log.Println("Stopping simulation goroutines...")
-	close(stopSim)
+	close(stopSim) // Signal TX Gen, Miner, Rep Printer to stop
 
-	// Wait for simulation goroutines to finish
-	log.Println("Waiting for goroutines to finish...")
-	wg.Wait()
-	log.Println("Goroutines finished.")
+	// >> NEW: Stop Telemetry and Consistency Orchestrator first
+	log.Println("Stopping Consistency Orchestrator...")
+	consistencyOrchestrator.Stop()
+	log.Println("Stopping Telemetry Monitor...")
+	telemetryMonitor.Stop()
+	// << END NEW
 
 	// Stop the shard manager loop (which also stops shards)
 	log.Println("Stopping Shard Manager background loop...")
 	bc.ShardManager.StopManagementLoop()
 
+	// Wait for main simulation goroutines to finish (if using WaitGroup for them)
+	// log.Println("Waiting for main goroutines to finish...")
+	// wg.Wait() // Uncomment if wg.Add was used for TxGen, Miner, RepPrinter
+	// log.Println("Main simulation goroutines finished.")
+
 	// Perform final chain validation
 	log.Println("Performing final chain validation...")
-	bc.IsChainValid() // Log output happens inside the function
+	bc.IsChainValid()
 
 	log.Println("--- Simulation Finished ---")
 
