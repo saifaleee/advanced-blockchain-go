@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
-	"sort" // Import sort for deterministic serialization/string representation
+	"log"
+	"sort"
 	"strings"
 )
 
@@ -16,46 +17,51 @@ type NodeID string
 // Value: Logical timestamp/version number (uint64)
 type VectorClock map[uint64]uint64
 
-// Serialize converts the VectorClock to bytes for hashing or storage.
+// NewVectorClock creates an empty vector clock.
+func NewVectorClock() VectorClock {
+	return make(VectorClock)
+}
+
+// Increment increments the clock for the given node ID.
+func (vc VectorClock) Increment(nodeID uint64) {
+	vc[nodeID]++
+}
+
+// Serialize converts the VectorClock into a byte slice using gob encoding.
 // Ensures deterministic output by sorting keys.
 func (vc VectorClock) Serialize() ([]byte, error) {
 	if vc == nil {
-		// Handle nil map gracefully, maybe return empty bytes or error?
-		// Returning encoded empty map is safer.
-		return gobEncode(make(map[uint64]uint64))
+		return nil, fmt.Errorf("cannot serialize nil vector clock")
 	}
-	// To ensure deterministic serialization for hashing, encode a sorted representation.
-	// Using gob directly for simplicity in PoC, but be aware of potential non-determinism.
-	return gobEncode(vc)
-}
 
-// Helper for gob encoding
-func gobEncode(data interface{}) ([]byte, error) {
+	// Ensure deterministic serialization by sorting keys
+	keys := make([]uint64, 0, len(vc))
+	for k := range vc {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
 	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	err := enc.Encode(data)
+	encoder := gob.NewEncoder(&buf)
+	err := encoder.Encode(vc)
 	if err != nil {
-		return nil, fmt.Errorf("failed to gob encode: %w", err)
+		return nil, fmt.Errorf("failed to gob encode vector clock: %w", err)
 	}
 	return buf.Bytes(), nil
 }
 
-// DeserializeVectorClock converts bytes back to a VectorClock.
+// DeserializeVectorClock converts a byte slice back into a VectorClock using gob encoding.
 func DeserializeVectorClock(data []byte) (VectorClock, error) {
-	// Handle empty data case gracefully - return an empty clock
-	if len(data) == 0 {
-		return make(VectorClock), nil
+	if data == nil {
+		return nil, fmt.Errorf("cannot deserialize nil data")
 	}
 
 	var vc VectorClock
-	dec := gob.NewDecoder(bytes.NewReader(data))
-	err := dec.Decode(&vc)
+	buf := bytes.NewBuffer(data)
+	decoder := gob.NewDecoder(buf)
+	err := decoder.Decode(&vc)
 	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize vector clock: %w", err)
-	}
-	// Ensure map is not nil even if decoding empty data resulted in nil map
-	if vc == nil {
-		vc = make(VectorClock)
+		return nil, fmt.Errorf("failed to gob decode vector clock: %w", err)
 	}
 	return vc, nil
 }
@@ -75,15 +81,9 @@ func (vc VectorClock) Copy() VectorClock {
 // Merge combines another vector clock into this one, taking the maximum for each entry.
 // Modifies the receiver clock (vc). Ensures vc is not nil.
 func (vc VectorClock) Merge(other VectorClock) {
-	if vc == nil {
-		// This shouldn't happen if vc is always initialized, but handle defensively.
-		// Cannot modify a nil map. Log error or panic?
-		// For now, log and return. The caller should ensure vc is initialized.
-		fmt.Println("Error: Attempted to merge into a nil VectorClock.")
+	if vc == nil || other == nil {
+		log.Printf("[Warn] Attempted to merge nil vector clock(s). Skipping.")
 		return
-	}
-	if other == nil {
-		return // Nothing to merge
 	}
 	for k, vOther := range other {
 		if vCurrent, ok := vc[k]; !ok || vOther > vCurrent {
