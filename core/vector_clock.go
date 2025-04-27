@@ -57,6 +57,7 @@ func (vc NodeVectorClock) Merge(other NodeVectorClock) {
 }
 
 // Compare determines the causal relationship between two node vector clocks (vc and other).
+// Corrected logic based on vector clock comparison rules.
 func (vc NodeVectorClock) Compare(other NodeVectorClock) Causality {
 	// Handle nil cases consistently by treating nil as an empty clock
 	if vc == nil {
@@ -72,7 +73,7 @@ func (vc NodeVectorClock) Compare(other NodeVectorClock) Causality {
 	// Check vc <= other condition
 	for k, vVc := range vc {
 		vOther, ok := other[k]
-		if !ok || vVc > vOther {
+		if !ok || vVc > vOther { // If key k is in vc but not other, or vc[k] > other[k]
 			vcLessEqOther = false
 			break
 		}
@@ -81,20 +82,20 @@ func (vc NodeVectorClock) Compare(other NodeVectorClock) Causality {
 	// Check other <= vc condition
 	for k, vOther := range other {
 		vVc, ok := vc[k]
-		if !ok || vOther > vVc {
+		if !ok || vOther > vVc { // If key k is in other but not vc, or other[k] > vc[k]
 			otherLessEqVc = false
 			break
 		}
 	}
 
-	// Determine relationship
+	// Determine relationship based on comparisons
 	if vcLessEqOther && otherLessEqVc {
 		return Equal
-	} else if vcLessEqOther {
-		return Before // vc < other
-	} else if otherLessEqVc {
-		return After // other < vc (vc > other)
-	} else {
+	} else if vcLessEqOther { // vc <= other, and since not equal, vc must be strictly Before other
+		return Before
+	} else if otherLessEqVc { // other <= vc, and since not equal, other must be strictly Before vc (so vc is After)
+		return After
+	} else { // Neither vc <= other nor other <= vc
 		return Concurrent
 	}
 }

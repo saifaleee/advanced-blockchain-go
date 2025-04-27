@@ -2,198 +2,532 @@ package core_test
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
+	"math"
+	"math/big"
+	"sort"
 	"testing"
-	"time"
 
-	"github.com/saifaleee/advanced-blockchain-go/core"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+
+	core "github.com/saifaleee/advanced-blockchain-go/core"
 )
 
-// --- Mock VRF Tests ---
-
-func TestMockVRF_Determinism(t *testing.T) {
-	input := []byte("test-input")
-	nodeID1 := core.NodeID("node1")
-	nodeID2 := core.NodeID("node2")
-
-	output1a := core.MockVRF(input, nodeID1)
-	output1b := core.MockVRF(input, nodeID1)
-	output2 := core.MockVRF(input, nodeID2)
-	output3 := core.MockVRF([]byte("other-input"), nodeID1)
-
-	require.NotNil(t, output1a)
-	require.NotNil(t, output1b)
-	require.NotNil(t, output2)
-	require.NotNil(t, output3)
-
-	// Same input, same node -> same output
-	assert.Equal(t, output1a.Hash, output1b.Hash, "Same input/node should yield same hash")
-	assert.Equal(t, output1a.Proof, output1b.Proof, "Same input/node should yield same proof")
-
-	// Same input, different node -> different output
-	assert.NotEqual(t, output1a.Hash, output2.Hash, "Different node should yield different hash")
-
-	// Different input, same node -> different output
-	assert.NotEqual(t, output1a.Hash, output3.Hash, "Different input should yield different hash")
-
-	// Check basic proof structure (contains input and hash)
-	assert.True(t, bytes.Contains(output1a.Proof, output1a.Input))
-	assert.True(t, bytes.Contains(output1a.Proof, output1a.Hash))
+// --- Local VRF interface for mocking ---
+type VRF interface {
+	Evaluate(input []byte) (output []byte, proof []byte, err error)
+	Verify(publicKey, input, output, proof []byte) (bool, error)
 }
 
-func TestVerifyMockVRF(t *testing.T) {
-	input := []byte("verify-input")
-	nodeID := core.NodeID("verifierNode")
+// --- Global VRF instance for mocking ---
+var vrfInstance VRF // Use the local interface type
 
-	// Correct output
-	correctOutput := core.MockVRF(input, nodeID)
-	assert.True(t, core.VerifyMockVRF(correctOutput, nodeID), "Verification should pass for correct output")
+// --- Vector Clock Tests ---
 
-	// Incorrect NodeID for verification
-	assert.False(t, core.VerifyMockVRF(correctOutput, core.NodeID("wrongNode")), "Verification should fail for wrong node ID")
-
-	// Tampered Hash
-	tamperedOutput := core.MockVRF(input, nodeID)
-	tamperedOutput.Hash[0] ^= 0xff // Flip first byte
-	assert.False(t, core.VerifyMockVRF(tamperedOutput, nodeID), "Verification should fail for tampered hash")
-
-	// Nil output
-	assert.False(t, core.VerifyMockVRF(nil, nodeID), "Verification should fail for nil output")
+func TestVectorClock_New(t *testing.T) {
+	vc := core.NewVectorClock()
+	assert.NotNil(t, vc)
+	assert.Empty(t, vc, "New vector clock should be empty")
 }
 
-// --- Conflict Resolution Tests ---
+func TestVectorClock_Increment(t *testing.T) {
+	vc := core.NewVectorClock()
+	var nodeID1 uint64 = 1 // Use uint64 directly as per VectorClock definition
+	var nodeID2 uint64 = 2
 
-func createTestConflictingItem(t *testing.T, id string, value string, nodeID core.NodeID, vrfInput []byte) *core.ConflictingItem {
-	version := &core.StateVersion{
-		Value:     []byte(value),
-		Clock:     core.NewVectorClock(), // Keep clock simple for this test
-		Source:    nodeID,
-		Timestamp: time.Now(),
+	vc.Increment(nodeID1)
+	assert.Equal(t, uint64(1), vc[nodeID1], "Clock should be incremented for node1")
+
+	vc.Increment(nodeID1)
+	assert.Equal(t, uint64(2), vc[nodeID1], "Clock should be incremented again for node1")
+
+	vc.Increment(nodeID2)
+	assert.Equal(t, uint64(1), vc[nodeID2], "Clock should be incremented for node2")
+	assert.Equal(t, uint64(2), vc[nodeID1], "Clock for node1 should remain unchanged")
+}
+
+func TestVectorClock_Compare(t *testing.T) {
+	vc1 := core.NewVectorClock()
+	vc2 := core.NewVectorClock()
+	var nodeA uint64 = 1 // Use uint64
+	var nodeB uint64 = 2
+	var nodeC uint64 = 3
+	var nodeX uint64 = 10
+	var nodeY uint64 = 11
+
+	// Initially equal
+	assert.Equal(t, 0, vc1.Compare(vc2), "Initially clocks should be equal") // Use int constants from Compare return type
+	assert.Equal(t, 0, vc2.Compare(vc1), "Initially clocks should be equal (commutative)")
+
+	// vc1 happens before vc2
+	vc1.Increment(nodeA) // vc1: {1:1}
+	assert.Equal(t, -1, vc1.Compare(vc2), "vc1 should happen before vc2 (empty)")
+	assert.Equal(t, 1, vc2.Compare(vc1), "vc2 (empty) should happen after vc1")
+
+	vc2.Increment(nodeA) // vc2: {1:1}
+	assert.Equal(t, 0, vc1.Compare(vc2), "Clocks should be equal after same increment")
+
+	vc2.Increment(nodeB) // vc1: {1:1}, vc2: {1:1, 2:1}
+	assert.Equal(t, -1, vc1.Compare(vc2), "vc1 should happen before vc2")
+	assert.Equal(t, 1, vc2.Compare(vc1), "vc2 should happen after vc1")
+
+	// Concurrent change
+	vc1.Increment(nodeC) // vc1: {1:1, 3:1}, vc2: {1:1, 2:1}
+	assert.Equal(t, 2, vc1.Compare(vc2), "Clocks should be concurrent")
+	assert.Equal(t, 2, vc2.Compare(vc1), "Clocks should be concurrent (commutative)")
+
+	// vc2 catches up and surpasses
+	vc2.Increment(nodeC) // vc1: {1:1, 3:1}, vc2: {1:1, 2:1, 3:1}
+	assert.Equal(t, -1, vc1.Compare(vc2), "vc1 should happen before vc2")
+	assert.Equal(t, 1, vc2.Compare(vc1), "vc2 should happen after vc1")
+
+	// Test with different sets of nodes
+	vc3 := core.NewVectorClock()
+	vc4 := core.NewVectorClock()
+	vc3.Increment(nodeX) // vc3: {10:1}
+	vc4.Increment(nodeY) // vc4: {11:1}
+	assert.Equal(t, 2, vc3.Compare(vc4), "Clocks with disjoint node sets should be concurrent")
+}
+
+func TestVectorClock_Merge(t *testing.T) {
+	vc1 := core.NewVectorClock()
+	vc2 := core.NewVectorClock()
+	var nodeA uint64 = 1 // Use uint64
+	var nodeB uint64 = 2
+	var nodeC uint64 = 3
+
+	vc1.Increment(nodeA) // vc1: {1:1}
+	vc2.Increment(nodeB) // vc2: {2:1}
+	vc1.Increment(nodeC) // vc1: {1:1, 3:1}
+	vc2.Increment(nodeC) // vc2: {2:1, 3:1}
+	vc2.Increment(nodeC) // vc2: {2:1, 3:2}
+
+	// Create copies to test merge without modifying originals directly in assertion
+	vc1Copy := vc1.Copy()
+	vc1Copy.Merge(vc2) // Modify vc1Copy
+
+	expectedVC := core.VectorClock{nodeA: 1, nodeB: 1, nodeC: 2}
+	assert.Equal(t, expectedVC, vc1Copy, "Merged clock should contain max of each entry")
+
+	// Ensure original clocks are not modified by the merge operation itself
+	assert.Equal(t, core.VectorClock{nodeA: 1, nodeC: 1}, vc1)
+	assert.Equal(t, core.VectorClock{nodeB: 1, nodeC: 2}, vc2)
+
+	// Merge with empty
+	vc3 := core.NewVectorClock()
+	vc1CopyForEmptyTest := vc1.Copy()
+	vc1CopyForEmptyTest.Merge(vc3) // Merge empty into vc1 copy
+	assert.Equal(t, vc1, vc1CopyForEmptyTest, "Merging with empty should return original")
+
+	vc3Copy := vc3.Copy()
+	vc3Copy.Merge(vc1) // Merge vc1 into empty copy
+	assert.Equal(t, vc1, vc3Copy, "Merging empty with other should return other")
+}
+
+// --- Entropy Calculation Tests ---
+
+func TestCalculateStateEntropy(t *testing.T) {
+	resolver := core.NewConflictResolver()
+
+	tests := []struct {
+		name            string
+		versions        map[core.NodeID]core.StateVersion
+		expectedEntropy float64
+		expectError     bool
+	}{
+		{
+			name:            "Empty input",
+			versions:        map[core.NodeID]core.StateVersion{},
+			expectedEntropy: 0.0,
+			expectError:     false,
+		},
+		{
+			name: "Single version",
+			versions: map[core.NodeID]core.StateVersion{
+				// Use string literal for NodeID
+				core.NodeID("1"): {Key: "k1", Value: "hash1", VectorClock: core.NewVectorClock(), SourceNode: core.NodeID("1")},
+			},
+			expectedEntropy: 0.0, // Entropy of a single outcome is 0
+			expectError:     false,
+		},
+		{
+			name: "All same versions",
+			versions: map[core.NodeID]core.StateVersion{
+				// Use string literals for NodeID
+				core.NodeID("1"): {Key: "k1", Value: "hash1", VectorClock: core.NewVectorClock(), SourceNode: core.NodeID("1")},
+				core.NodeID("2"): {Key: "k1", Value: "hash1", VectorClock: core.NewVectorClock(), SourceNode: core.NodeID("2")},
+				core.NodeID("3"): {Key: "k1", Value: "hash1", VectorClock: core.NewVectorClock(), SourceNode: core.NodeID("3")},
+			},
+			expectedEntropy: 0.0, // Only one distinct state hash
+			expectError:     false,
+		},
+		{
+			name: "Two distinct versions (equal split)",
+			versions: map[core.NodeID]core.StateVersion{
+				// Use string literals for NodeID
+				core.NodeID("1"): {Key: "k1", Value: "hash1", VectorClock: core.NewVectorClock(), SourceNode: core.NodeID("1")},
+				core.NodeID("2"): {Key: "k1", Value: "hash2", VectorClock: core.NewVectorClock(), SourceNode: core.NodeID("2")},
+			},
+			// p(hash1) = 0.5, p(hash2) = 0.5
+			// Entropy = - (0.5 * log2(0.5) + 0.5 * log2(0.5)) = - (0.5 * -1 + 0.5 * -1) = 1.0
+			expectedEntropy: 1.0,
+			expectError:     false,
+		},
+		{
+			name: "Three distinct versions (equal split)",
+			versions: map[core.NodeID]core.StateVersion{
+				// Use string literals for NodeID
+				core.NodeID("1"): {Key: "k1", Value: "hash1", VectorClock: core.NewVectorClock(), SourceNode: core.NodeID("1")},
+				core.NodeID("2"): {Key: "k1", Value: "hash2", VectorClock: core.NewVectorClock(), SourceNode: core.NodeID("2")},
+				core.NodeID("3"): {Key: "k1", Value: "hash3", VectorClock: core.NewVectorClock(), SourceNode: core.NodeID("3")},
+			},
+			// p = 1/3 for each
+			// Entropy = - 3 * (1/3 * log2(1/3)) = -log2(1/3) = log2(3) approx 1.585
+			expectedEntropy: math.Log2(3),
+			expectError:     false,
+		},
+		{
+			name: "Multiple versions, unequal split",
+			versions: map[core.NodeID]core.StateVersion{
+				// Use string literals for NodeID
+				core.NodeID("1"): {Key: "k1", Value: "hash1", VectorClock: core.NewVectorClock(), SourceNode: core.NodeID("1")}, // p=0.5
+				core.NodeID("2"): {Key: "k1", Value: "hash1", VectorClock: core.NewVectorClock(), SourceNode: core.NodeID("2")}, // p=0.5
+				core.NodeID("3"): {Key: "k1", Value: "hash2", VectorClock: core.NewVectorClock(), SourceNode: core.NodeID("3")}, // p=0.25
+				core.NodeID("4"): {Key: "k1", Value: "hash3", VectorClock: core.NewVectorClock(), SourceNode: core.NodeID("4")}, // p=0.25
+			},
+			// p(hash1)=0.5, p(hash2)=0.25, p(hash3)=0.25
+			// Entropy = - (0.5*log2(0.5) + 0.25*log2(0.25) + 0.25*log2(0.25))
+			// Entropy = - (0.5*(-1) + 0.25*(-2) + 0.25*(-2))
+			// Entropy = - (-0.5 - 0.5 - 0.5) = 1.5
+			expectedEntropy: 1.5,
+			expectError:     false,
+		},
 	}
-	vrfOutput := core.MockVRF(vrfInput, nodeID)
-	require.NotNil(t, vrfOutput)
 
-	return &core.ConflictingItem{
-		ID:        id,
-		Version:   version,
-		VRFInput:  vrfInput,
-		VRFOutput: vrfOutput,
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entropy, err := resolver.CalculateStateEntropy(tt.versions)
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				// Use tolerance for floating point comparison
+				assert.InDelta(t, tt.expectedEntropy, entropy, 1e-9, "Entropy calculation mismatch")
+			}
+		})
 	}
 }
 
-func TestResolveConflictVRF_SingleItem(t *testing.T) {
-	vrfInput := []byte("resolve-input")
-	item1 := createTestConflictingItem(t, "item1", "valueA", "nodeA", vrfInput)
+// --- VRF Conflict Resolution Tests ---
 
-	winner, err := core.ResolveConflictVRF([]*core.ConflictingItem{item1})
-	require.NoError(t, err)
-	assert.Same(t, item1, winner)
-}
+// MockVRF implementation using the local VRF interface
+type MockVRF struct{}
 
-func TestResolveConflictVRF_MultipleItems(t *testing.T) {
-	vrfInput := []byte("resolve-input-multi")
-	nodeA := core.NodeID("nodeA")
-	nodeB := core.NodeID("nodeB")
-	nodeC := core.NodeID("nodeC")
-
-	itemA := createTestConflictingItem(t, "item", "valueA", nodeA, vrfInput)
-	itemB := createTestConflictingItem(t, "item", "valueB", nodeB, vrfInput)
-	itemC := createTestConflictingItem(t, "item", "valueC", nodeC, vrfInput)
-
-	items := []*core.ConflictingItem{itemA, itemB, itemC}
-
-	// Determine expected winner manually by comparing hashes
-	expectedWinner := itemA
-	if bytes.Compare(itemB.VRFOutput.Hash, expectedWinner.VRFOutput.Hash) < 0 {
-		expectedWinner = itemB
+// Evaluate simulates VRF evaluation (simple reversal for predictability)
+func (m *MockVRF) Evaluate(input []byte) (output []byte, proof []byte, err error) {
+	// Simple deterministic output for testing: reverse the input bytes
+	// In a real VRF, this would be a pseudo-random but verifiable output.
+	out := make([]byte, len(input))
+	for i := range input {
+		out[i] = input[len(input)-1-i]
 	}
-	if bytes.Compare(itemC.VRFOutput.Hash, expectedWinner.VRFOutput.Hash) < 0 {
-		expectedWinner = itemC
+	// Generate a predictable proof based on input/output for mock verification
+	h := sha256.New()
+	h.Write(input)
+	h.Write(out)
+	mockProof := h.Sum(nil)
+
+	// Ensure proof has the expected length for VerifyVRF compatibility if needed elsewhere
+	if len(mockProof) != sha256.Size {
+		panic(fmt.Sprintf("mock proof length %d != %d", len(mockProof), sha256.Size))
 	}
 
-	winner, err := core.ResolveConflictVRF(items)
-	require.NoError(t, err)
-	assert.Same(t, expectedWinner, winner, fmt.Sprintf("Expected winner %s, got %s", expectedWinner.Version.Source, winner.Version.Source))
-	t.Logf("VRF Hashes: A:%x, B:%x, C:%x", itemA.VRFOutput.Hash, itemB.VRFOutput.Hash, itemC.VRFOutput.Hash)
-	t.Logf("Winner: %s", winner.Version.Source)
+	return out, mockProof, nil
 }
 
-func TestResolveConflictVRF_EmptyInput(t *testing.T) {
-	_, err := core.ResolveConflictVRF([]*core.ConflictingItem{})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no items provided")
+// Verify simulates VRF verification based on the mock Evaluate logic
+func (m *MockVRF) Verify(publicKey, input, output, proof []byte) (bool, error) {
+	// Re-calculate the expected proof based on input and output
+	h := sha256.New()
+	h.Write(input)
+	h.Write(output)
+	expectedProof := h.Sum(nil)
+	// Compare calculated proof with the provided proof
+	return bytes.Equal(proof, expectedProof), nil
 }
 
-func TestResolveConflictVRF_MissingData(t *testing.T) {
-	vrfInput := []byte("resolve-input-missing")
-	item1 := createTestConflictingItem(t, "item1", "valueA", "nodeA", vrfInput)
-	item2 := createTestConflictingItem(t, "item2", "valueB", "nodeB", vrfInput)
-	item2.VRFOutput = nil // Simulate missing VRF output
+func TestResolveConflictVRF(t *testing.T) {
+	resolver := core.NewConflictResolver()
+	mockVrf := &MockVRF{} // Use the local mock implementation
+	seed := []byte("test-seed")
 
-	_, err := core.ResolveConflictVRF([]*core.ConflictingItem{item1, item2})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "missing version or VRF output")
+	var nodeA core.NodeID = "nodeA" // Use NodeID type
+	var nodeB core.NodeID = "nodeB"
+	var nodeC core.NodeID = "nodeC"
+	var nodeX core.NodeID = "nodeX"
+	var nodeY core.NodeID = "nodeY"
 
-	item2.VRFOutput = core.MockVRF(vrfInput, "nodeB") // Restore VRF
-	item2.Version = nil                               // Simulate missing version
-	_, err = core.ResolveConflictVRF([]*core.ConflictingItem{item1, item2})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "missing version or VRF output")
+	vc1 := core.NewVectorClock()
+	vc1.Increment(1) // Use uint64 for clock keys
+	v1 := core.StateVersion{Key: "k1", Value: "hash1", VectorClock: vc1, SourceNode: nodeA}
+
+	vc2 := core.NewVectorClock()
+	vc2.Increment(2)
+	v2 := core.StateVersion{Key: "k1", Value: "hash2", VectorClock: vc2, SourceNode: nodeB}
+
+	vc3 := core.NewVectorClock()
+	vc3.Increment(3)
+	v3 := core.StateVersion{Key: "k1", Value: "hash3", VectorClock: vc3, SourceNode: nodeC}
+
+	tests := []struct {
+		name                string
+		conflictingVersions []core.StateVersion
+		expectedWinnerIndex int // Index in the input slice
+		expectError         bool
+	}{
+		{
+			name:                "No conflicts",
+			conflictingVersions: []core.StateVersion{},
+			expectedWinnerIndex: -1, // Expect error
+			expectError:         true,
+		},
+		{
+			name:                "Single version",
+			conflictingVersions: []core.StateVersion{v1},
+			expectedWinnerIndex: 0,
+			expectError:         false,
+		},
+		{
+			name:                "Two conflicting versions",
+			conflictingVersions: []core.StateVersion{v1, v2},
+			expectedWinnerIndex: 0, // Assume v1 wins based on mock VRF
+			expectError:         false,
+		},
+		{
+			name:                "Three conflicting versions",
+			conflictingVersions: []core.StateVersion{v1, v2, v3},
+			expectedWinnerIndex: 0,
+			expectError:         false,
+		},
+		{
+			name: "Identical values (should still pick one deterministically based on NodeID/VC)",
+			conflictingVersions: []core.StateVersion{
+				{Key: "k_same", Value: "val_same", VectorClock: core.VectorClock{10: 1}, SourceNode: nodeX},
+				{Key: "k_same", Value: "val_same", VectorClock: core.VectorClock{11: 1}, SourceNode: nodeY}, // Different NodeID/VC
+			},
+			expectedWinnerIndex: 0, // Assuming version from nodeX wins
+			expectError:         false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			originalVrf := vrfInstance                   // Store original global VRF (if any)
+			vrfInstance = mockVrf                        // Inject mock
+			defer func() { vrfInstance = originalVrf }() // Restore original
+
+			winner, err := resolver.ResolveConflictVRF(tt.conflictingVersions, seed)
+
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.conflictingVersions[tt.expectedWinnerIndex], winner, "Incorrect winner selected by VRF")
+			}
+		})
+	}
 }
 
-func TestResolveConflictVRF_InputMismatch(t *testing.T) {
-	vrfInput1 := []byte("resolve-input-1")
-	vrfInput2 := []byte("resolve-input-2")
-	item1 := createTestConflictingItem(t, "item1", "valueA", "nodeA", vrfInput1)
-	item2 := createTestConflictingItem(t, "item2", "valueB", "nodeB", vrfInput2)
-	// Manually create mismatch
-	item1.VRFOutput.Input = vrfInput2
+// --- HandlePotentialConflict Tests (Rewritten) ---
 
-	_, err := core.ResolveConflictVRF([]*core.ConflictingItem{item1, item2})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "VRF input mismatch")
-}
+func TestHandlePotentialConflict(t *testing.T) {
+	resolver := core.NewConflictResolver()
+	// Inject mock VRF globally for ResolveConflictVRF called internally
+	originalVrf := vrfInstance
+	vrfInstance = &MockVRF{}
+	defer func() { vrfInstance = originalVrf }()
 
-// --- Entropy Detection Tests (Placeholder) ---
+	var nodeA core.NodeID = "nodeA"
+	var nodeB core.NodeID = "nodeB"
 
-func TestDetectConflictEntropy_NoConflict(t *testing.T) {
-	key := []byte("entropy-key")
-	v1 := &core.StateVersion{Value: []byte("value"), Source: "nodeA"}
-	v2 := &core.StateVersion{Value: []byte("value"), Source: "nodeB"}
+	key := "testKey"
+	vrfContext := []byte("vrf-context-seed")
 
-	// Single version
-	conflict, entropy := core.DetectConflictEntropy(key, []*core.StateVersion{v1})
-	assert.False(t, conflict)
-	assert.Equal(t, 0.0, entropy)
+	// Helper function for manual serialization within the test
+	serializeStateVersionForVRF := func(sv core.StateVersion) ([]byte, error) {
+		var buf bytes.Buffer
+		buf.WriteString(sv.Key)
+		// Convert value to bytes - handle different types if necessary
+		valueBytes := []byte(fmt.Sprintf("%v", sv.Value))
+		buf.Write(valueBytes)
+		vcBytes, err := sv.VectorClock.Serialize()
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize vector clock: %w", err)
+		}
+		buf.Write(vcBytes)
+		buf.WriteString(string(sv.SourceNode))
+		return buf.Bytes(), nil
+	}
 
-	// Multiple identical versions
-	conflict, entropy = core.DetectConflictEntropy(key, []*core.StateVersion{v1, v2})
-	assert.False(t, conflict)
-	assert.Equal(t, 0.0, entropy)
-}
+	t.Run("Different_Keys_Returns_Local", func(t *testing.T) {
+		localVC := core.VectorClock{1: 1}
+		remoteVC := core.VectorClock{2: 1}
+		local := core.StateVersion{Key: "keyLocal", Value: "valLocal", VectorClock: localVC, SourceNode: nodeA}
+		remote := core.StateVersion{Key: "keyRemote", Value: "valRemote", VectorClock: remoteVC, SourceNode: nodeB}
 
-func TestDetectConflictEntropy_Conflict(t *testing.T) {
-	key := []byte("entropy-key-conflict")
-	vA := &core.StateVersion{Value: []byte("valueA"), Source: "nodeA"}
-	vB := &core.StateVersion{Value: []byte("valueB"), Source: "nodeB"}
-	vC := &core.StateVersion{Value: []byte("valueA"), Source: "nodeC"} // Another A
+		resolved := resolver.HandlePotentialConflict(local, remote, vrfContext)
+		assert.Equal(t, local, resolved, "Should return local version when keys differ")
+	})
 
-	// Two different values (A, B) - Entropy = -(0.5*log2(0.5) + 0.5*log2(0.5)) = 1.0
-	conflict, entropy := core.DetectConflictEntropy(key, []*core.StateVersion{vA, vB})
-	assert.True(t, conflict, "Entropy should be > threshold (1.0 > 0.5)")
-	assert.InDelta(t, 1.0, entropy, 0.001)
+	t.Run("Local_HappensBefore_Remote_Returns_Remote_MergedClock", func(t *testing.T) {
+		// Local: {A:1}
+		localVC := core.VectorClock{uint64(1): 1} // Use uint64 keys
+		local := core.StateVersion{Key: key, Value: "valLocal", VectorClock: localVC, SourceNode: nodeA}
 
-	// Three versions, two types (A, B, A) - Entropy = -( (2/3)*log2(2/3) + (1/3)*log2(1/3) ) ~ 0.918
-	conflict, entropy = core.DetectConflictEntropy(key, []*core.StateVersion{vA, vB, vC})
-	assert.True(t, conflict, "Entropy should be > threshold (~0.918 > 0.5)")
-	assert.InDelta(t, 0.918, entropy, 0.001)
-}
+		// Remote: {A:1, B:1} (Happened after local)
+		remoteVC := core.VectorClock{uint64(1): 1, uint64(2): 1}
+		remote := core.StateVersion{Key: key, Value: "valRemote", VectorClock: remoteVC, SourceNode: nodeB}
 
-func TestDetectConflictEntropy_Empty(t *testing.T) {
-	key := []byte("entropy-key-empty")
-	conflict, entropy := core.DetectConflictEntropy(key, []*core.StateVersion{})
-	assert.False(t, conflict)
-	assert.Equal(t, 0.0, entropy)
+		resolved := resolver.HandlePotentialConflict(local, remote, vrfContext)
+
+		// Expected: Remote wins, clock is merged
+		expectedVC := core.VectorClock{uint64(1): 1, uint64(2): 1}
+		expected := remote
+		expected.VectorClock = expectedVC // The function modifies the clock of the returned version
+
+		assert.Equal(t, "valRemote", resolved.Value, "Should return remote value")
+		assert.Equal(t, expectedVC, resolved.VectorClock, "Should return merged vector clock")
+		assert.Equal(t, expected, resolved) // Check whole struct
+	})
+
+	t.Run("Remote_HappensBefore_Local_Returns_Local_MergedClock", func(t *testing.T) {
+		// Remote: {B:1}
+		remoteVC := core.VectorClock{uint64(2): 1}
+		remote := core.StateVersion{Key: key, Value: "valRemote", VectorClock: remoteVC, SourceNode: nodeB}
+
+		// Local: {B:1, A:1} (Happened after remote)
+		localVC := core.VectorClock{uint64(2): 1, uint64(1): 1}
+		local := core.StateVersion{Key: key, Value: "valLocal", VectorClock: localVC, SourceNode: nodeA}
+
+		resolved := resolver.HandlePotentialConflict(local, remote, vrfContext)
+
+		// Expected: Local wins, clock is merged
+		expectedVC := core.VectorClock{uint64(1): 1, uint64(2): 1}
+		expected := local
+		expected.VectorClock = expectedVC // The function modifies the clock of the returned version
+
+		assert.Equal(t, "valLocal", resolved.Value, "Should return local value")
+		assert.Equal(t, expectedVC, resolved.VectorClock, "Should return merged vector clock")
+		assert.Equal(t, expected, resolved) // Check whole struct
+	})
+
+	t.Run("Equal_Clocks_Resolves_With_VRF", func(t *testing.T) {
+		// Clocks are identical {A:1}
+		vc := core.VectorClock{uint64(1): 1}
+		local := core.StateVersion{Key: key, Value: "valLocal", VectorClock: vc.Copy(), SourceNode: nodeA}
+		remote := core.StateVersion{Key: key, Value: "valRemote", VectorClock: vc.Copy(), SourceNode: nodeB} // Different source node
+
+		// Determine VRF winner based on mock (depends on sorted order of NodeIDs)
+		// Assume nodeA < nodeB
+		sortedVersions := []core.StateVersion{local, remote}
+		sort.Slice(sortedVersions, func(i, j int) bool {
+			return sortedVersions[i].SourceNode < sortedVersions[j].SourceNode
+		})
+
+		hasher := sha256.New()
+		hasher.Write(vrfContext)
+		for _, v := range sortedVersions {
+			vBytes, err := serializeStateVersionForVRF(v)
+			assert.NoError(t, err, "Serialization for VRF failed")
+			hasher.Write(vBytes)
+		}
+		vrfInput := hasher.Sum(nil)
+		vrfOutput, _, _ := vrfInstance.Evaluate(vrfInput) // Use mocked Evaluate
+		winnerIndex := int(new(big.Int).Mod(new(big.Int).SetBytes(vrfOutput), big.NewInt(2)).Int64())
+		expectedWinner := sortedVersions[winnerIndex]
+
+		resolved := resolver.HandlePotentialConflict(local, remote, vrfContext)
+
+		// Expected: VRF winner, clock is merged
+		expectedVC := core.VectorClock{uint64(1): 1} // Merge of {A:1} and {A:1} is {A:1}
+		expected := expectedWinner
+		expected.VectorClock = expectedVC // Function should set the merged clock
+
+		assert.Equal(t, expectedWinner.Value, resolved.Value, "Should return VRF winner value")
+		assert.Equal(t, expectedVC, resolved.VectorClock, "Should return merged vector clock")
+		assert.Equal(t, expected, resolved)
+	})
+
+	t.Run("Concurrent_Clocks_Resolves_With_VRF", func(t *testing.T) {
+		// Local: {A:1}, Remote: {B:1} -> Concurrent
+		localVC := core.VectorClock{uint64(1): 1}
+		local := core.StateVersion{Key: key, Value: "valLocal", VectorClock: localVC, SourceNode: nodeA}
+		remoteVC := core.VectorClock{uint64(2): 1}
+		remote := core.StateVersion{Key: key, Value: "valRemote", VectorClock: remoteVC, SourceNode: nodeB}
+
+		// Determine VRF winner (same logic as Equal_Clocks case)
+		sortedVersions := []core.StateVersion{local, remote}
+		sort.Slice(sortedVersions, func(i, j int) bool {
+			return sortedVersions[i].SourceNode < sortedVersions[j].SourceNode
+		})
+		hasher := sha256.New()
+		hasher.Write(vrfContext)
+		for _, v := range sortedVersions {
+			vBytes, err := serializeStateVersionForVRF(v)
+			assert.NoError(t, err, "Serialization for VRF failed")
+			hasher.Write(vBytes)
+		}
+		vrfInput := hasher.Sum(nil)
+		vrfOutput, _, _ := vrfInstance.Evaluate(vrfInput)
+		winnerIndex := int(new(big.Int).Mod(new(big.Int).SetBytes(vrfOutput), big.NewInt(2)).Int64())
+		expectedWinner := sortedVersions[winnerIndex]
+
+		resolved := resolver.HandlePotentialConflict(local, remote, vrfContext)
+
+		// Expected: VRF winner, clock is merged
+		expectedVC := core.VectorClock{uint64(1): 1, uint64(2): 1} // Merge of {A:1} and {B:1}
+		expected := expectedWinner
+		expected.VectorClock = expectedVC // Function should set the merged clock
+
+		assert.Equal(t, expectedWinner.Value, resolved.Value, "Should return VRF winner value")
+		assert.Equal(t, expectedVC, resolved.VectorClock, "Should return merged vector clock")
+		assert.Equal(t, expected, resolved)
+	})
+
+	t.Run("Concurrent_Clocks_With_Overlap_Resolves_With_VRF", func(t *testing.T) {
+		// Local: {A:1, C:1}, Remote: {B:1, C:2} -> Concurrent
+		localVC := core.VectorClock{uint64(1): 1, uint64(3): 1}
+		local := core.StateVersion{Key: key, Value: "valLocal", VectorClock: localVC, SourceNode: nodeA}
+		remoteVC := core.VectorClock{uint64(2): 1, uint64(3): 2} // C is higher in remote
+		remote := core.StateVersion{Key: key, Value: "valRemote", VectorClock: remoteVC, SourceNode: nodeB}
+
+		// Determine VRF winner
+		sortedVersions := []core.StateVersion{local, remote}
+		sort.Slice(sortedVersions, func(i, j int) bool {
+			return sortedVersions[i].SourceNode < sortedVersions[j].SourceNode
+		})
+		hasher := sha256.New()
+		hasher.Write(vrfContext)
+		for _, v := range sortedVersions {
+			vBytes, err := serializeStateVersionForVRF(v)
+			assert.NoError(t, err, "Serialization for VRF failed")
+			hasher.Write(vBytes)
+		}
+		vrfInput := hasher.Sum(nil)
+		vrfOutput, _, _ := vrfInstance.Evaluate(vrfInput)
+		winnerIndex := int(new(big.Int).Mod(new(big.Int).SetBytes(vrfOutput), big.NewInt(2)).Int64())
+		expectedWinner := sortedVersions[winnerIndex]
+
+		resolved := resolver.HandlePotentialConflict(local, remote, vrfContext)
+
+		// Expected: VRF winner, clock is merged
+		expectedVC := core.VectorClock{uint64(1): 1, uint64(2): 1, uint64(3): 2} // Merge takes max
+		expected := expectedWinner
+		expected.VectorClock = expectedVC // Function should set the merged clock
+
+		assert.Equal(t, expectedWinner.Value, resolved.Value, "Should return VRF winner value")
+		assert.Equal(t, expectedVC, resolved.VectorClock, "Should return merged vector clock")
+		assert.Equal(t, expected, resolved)
+	})
 }

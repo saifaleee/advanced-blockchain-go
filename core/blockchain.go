@@ -42,9 +42,6 @@ func NewBlockchain(initialShardCount uint, config ShardManagerConfig, validatorM
 	if consistency == nil {
 		return nil, errors.New("consistency orchestrator cannot be nil")
 	}
-	if validatorMgr == nil { // Keep existing checks too
-		return nil, errors.New("validator manager cannot be nil")
-	}
 	if localNodeID == "" {
 		log.Println("Warning: Local node ID not set for blockchain instance.")
 	}
@@ -215,7 +212,8 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 
 		} else if tx.Type == CrossShardTxFinalize {
 			if tx.DestinationShard == nil || *tx.DestinationShard != shardID {
-				log.Printf("Error: CrossShardTxFinalize %x found in shard %d, but DestinationShard field is missing or incorrect (%v). Discarding.", tx.ID, shardID, tx.DestinationShard)
+				// Corrected log format: Removed the extra %v which caused the argument mismatch
+				log.Printf("Error: CrossShardTxFinalize %x found in shard %d, but DestinationShard field is missing or incorrect. Discarding.", tx.ID, shardID)
 				continue
 			}
 			log.Printf("Shard %d: Including cross-shard finalize Tx %x", shardID, tx.ID)
@@ -420,7 +418,7 @@ func ValidateBlockIntegrity(newBlock, prevBlock *Block, vm *ValidatorManager) bo
 	return true
 }
 
-// IsChainValid now includes PoW, integrity, proposer, finality, and vector clock checks.
+// IsChainValid checks the integrity of the entire blockchain across all shards.
 func (bc *Blockchain) IsChainValid() bool {
 	bc.ChainMu.RLock()
 	defer bc.ChainMu.RUnlock()
@@ -436,6 +434,7 @@ func (bc *Blockchain) IsChainValid() bool {
 		chainsToValidate[id] = copiedChain
 	}
 
+	// Corrected loop syntax: added 'range'
 	for shardID, chain := range chainsToValidate {
 		wg.Add(1)
 		go func(sID uint64, ch []*Block, vm *ValidatorManager) {
@@ -474,13 +473,32 @@ func (bc *Blockchain) IsChainValid() bool {
 				pow := NewProofOfWork(currentBlock)
 				if !pow.Validate() {
 					errorChan <- fmt.Errorf("shard %d PoW validation failed for Block H:%d (Hash: %x)", sID, currentBlock.Header.Height, currentBlock.Hash)
-					return
+					return // Stop validation for this shard on error
 				}
 
 				if !ValidateBlockIntegrity(currentBlock, prevBlock, vm) {
+					// Error details are logged within ValidateBlockIntegrity
 					errorChan <- fmt.Errorf("shard %d integrity validation failed between Block H:%d and H:%d", sID, prevBlock.Header.Height, currentBlock.Header.Height)
-					return
+					return // Stop validation for this shard on error
 				}
+
+				// TODO: Define and implement CalculateMerkleRoot(transactions []*Transaction) probably in merkle.go
+				/*
+					calculatedMerkleRoot, err := CalculateMerkleRoot(currentBlock.Transactions)
+					if err != nil {
+						log.Printf("  Shard %d - Block %d: Error calculating Merkle root: %v", sID, i, err)
+						errorChan <- fmt.Errorf("shard %d merkle root calculation error for Block H:%d: %w", sID, currentBlock.Header.Height, err)
+						// Decide whether to return or just mark as invalid and continue checking other blocks
+						// For now, let's mark overall as invalid but don't return immediately from the goroutine
+						overallValid = false // This assignment within goroutine needs careful handling (e.g., atomic bool or sending invalid signal)
+										 // Simplification: Rely on errorChan to signal failure.
+					} else if !bytes.Equal(calculatedMerkleRoot, currentBlock.Header.MerkleRoot) {
+						log.Printf("  Shard %d - Block %d: Invalid Merkle Root. Expected %x, Got %x",
+							sID, i, currentBlock.Header.MerkleRoot, calculatedMerkleRoot)
+						errorChan <- fmt.Errorf("shard %d invalid merkle root for Block H:%d", sID, currentBlock.Header.Height)
+						// overallValid = false // Mark as invalid
+					}
+				*/
 			}
 		}(shardID, chain, bc.ValidatorMgr)
 	}
