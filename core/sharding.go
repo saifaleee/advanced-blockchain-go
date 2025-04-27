@@ -132,7 +132,7 @@ func (s *Shard) ApplyStateChanges(transactions []*Transaction) ([]byte, error) {
 			}
 		}
 		if key == nil {
-			key = tx.Hash() // Use hash as key if no specific key found
+			key = tx.ID // Replace tx.Hash() with tx.ID
 			value = tx.Data
 		}
 		keyStr = string(key) // Convert key to string for DB
@@ -152,7 +152,7 @@ func (s *Shard) ApplyStateChanges(transactions []*Transaction) ([]byte, error) {
 				VectorClock: make(VectorClock), // Corrected: Use make() for map[uint64]uint64
 				SourceNode:  "tx",
 			}
-			resolved := conflictResolver.HandlePotentialConflict(localVersion, remoteVersion, tx.Hash())
+			resolved := conflictResolver.HandlePotentialConflict(localVersion, remoteVersion, tx.ID) // Replace tx.Hash() with tx.ID
 			value = resolved.Value.([]byte)
 		}
 		// else: no existing value, just write

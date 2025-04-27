@@ -7,530 +7,328 @@ import (
 	"log"
 	"sync"
 	"time"
-	// Add import for NodeID if not already present implicitly
 )
 
-// Blockchain now manages multiple shards and includes consensus components.
+// Blockchain manages the overall blockchain system, including shards and consensus.
 type Blockchain struct {
-	ShardManager    *ShardManager
-	ValidatorMgr    *ValidatorManager        // Added Validator Manager
-	Consistency     *ConsistencyOrchestrator // <<< ADDED for Ticket 4
-	Difficulty      int                      // Global PoW difficulty (can be per-shard later)
-	ChainHeight     int                      // Approximate overall chain height (max shard height)
-	Mu              sync.RWMutex             // Protects global state like ChainHeight
-	BlockChains     map[uint64][]*Block      // In-memory storage per shard chain
-	ChainMu         sync.RWMutex             // Lock specifically for accessing blockChains map
-	LocalNodeID     NodeID                   // ID of the node running this blockchain instance (for proposing)
-	GenesisProposer NodeID                   // ID used for genesis blocks
+	ShardManager       *ShardManager
+	ValidatorManager   *ValidatorManager
+	ConsistencyManager *ConsistencyOrchestrator // Correct type name
+	Config             BlockchainConfig
+	mu                 sync.RWMutex
+	stopChan           chan struct{}       // Channel to signal stop
+	wg                 sync.WaitGroup      // WaitGroup to manage goroutines
+	BlockChains        map[uint64][]*Block // In-memory storage per shard chain - Use uint64 for shard ID consistency
+	ChainMu            sync.RWMutex        // Lock specifically for accessing blockChains map
+	ChainHeight        int                 // Approximate overall chain height (max shard height)
 }
 
-// NewBlockchain creates a new sharded blockchain with consensus mechanisms.
-func NewBlockchain(initialShardCount uint, config ShardManagerConfig, validatorMgr *ValidatorManager, consistency *ConsistencyOrchestrator, localNodeID NodeID) (*Blockchain, error) {
-	difficulty := 16 // Default difficulty, adjust as needed
-	if difficulty < 1 {
-		return nil, errors.New("difficulty must be at least 1")
-	}
-	if validatorMgr == nil {
-		return nil, errors.New("validator manager cannot be nil")
-	}
-	if localNodeID == "" {
-		log.Println("Warning: Local node ID not set for blockchain instance.")
-		// Assign a default or generate one? For simulation, allow empty but log warning.
+// BlockchainConfig holds configuration parameters for the blockchain.
+type BlockchainConfig struct {
+	NumValidators            int
+	InitialReputation        int64
+	PoWDifficulty            int
+	TelemetryInterval        time.Duration
+	PruneKeepBlocks          int           // Added config for pruning
+	ConsistencyCheckInterval time.Duration // Added for Consistency Orchestrator
+	// Add other relevant config fields if needed
+}
+
+// NewBlockchain creates a new Blockchain instance.
+func NewBlockchain(numShards int, smConfig ShardManagerConfig, bcConfig BlockchainConfig, consConfig ConsistencyConfig) (*Blockchain, error) { // Added error return
+	vm := NewValidatorManager()
+	// Create Telemetry Monitor (needed for Consistency Orchestrator)
+	telemetryMonitor := NewNetworkTelemetryMonitor(bcConfig.TelemetryInterval) // Fix argument for NewNetworkTelemetryMonitor
+
+	cm := NewConsistencyOrchestrator(telemetryMonitor, consConfig, bcConfig.ConsistencyCheckInterval) // Pass monitor and interval
+
+	// Initialize Validators (Phase 4)
+	for i := 0; i < bcConfig.NumValidators; i++ {
+		nodeID := fmt.Sprintf("Validator-%d", i)
+		node, err := NewNode(NodeID(nodeID)) // Create node with keys, ensure NodeID type
+		if err != nil {
+			// Return error instead of fatal log
+			return nil, fmt.Errorf("failed to create node %s: %w", nodeID, err)
+		}
+		// Simulate authentication for now
+		node.Authenticate() // Mark as authenticated (Phase 4/8)
+
+		vm.AddValidator(node, bcConfig.InitialReputation) // Fix argument for AddValidator
 	}
 
-	// Add nil check for consistency orchestrator:
-	if consistency == nil {
-		return nil, errors.New("consistency orchestrator cannot be nil")
-	}
-	if localNodeID == "" {
-		log.Println("Warning: Local node ID not set for blockchain instance.")
-	}
-
-	sm, err := NewShardManager(config, int(initialShardCount))
+	// Initialize Shard Manager
+	sm, err := NewShardManager(smConfig, numShards) // Correct function call signature and handle error
 	if err != nil {
 		return nil, fmt.Errorf("failed to create shard manager: %w", err)
 	}
 
-	// Initialize Blockchain struct - Add Consistency field:
 	bc := &Blockchain{
-		ShardManager:    sm,
-		ValidatorMgr:    validatorMgr,
-		Consistency:     consistency, // <<< ADDED Assignment
-		Difficulty:      difficulty,
-		ChainHeight:     0,
-		BlockChains:     make(map[uint64][]*Block),
-		LocalNodeID:     localNodeID,
-		GenesisProposer: NodeID("GENESIS_" + localNodeID),
+		ShardManager:       sm, // Assign initialized ShardManager
+		ValidatorManager:   vm,
+		ConsistencyManager: cm, // Assign Consistency Manager
+		Config:             bcConfig,
+		stopChan:           make(chan struct{}),
+		BlockChains:        make(map[uint64][]*Block), // Use uint64 key
 	}
-
-	// Link ShardManager back to Blockchain
-	sm.SetBlockchainLink(bc)
-
-	// --- Explicitly manage lock and add checks/logging for genesis creation ---
-	bc.ChainMu.Lock() // Lock before modifying the map
-
-	shardIDs := sm.GetAllShardIDs()
-	log.Printf("[NewBlockchain] Starting genesis block creation for %d shards: %v", len(shardIDs), shardIDs)
-
-	for _, shardID := range shardIDs {
-		log.Printf("[NewBlockchain] Creating genesis for Shard %d...", shardID)
-		genesis := NewGenesisBlock(shardID, nil, bc.Difficulty, bc.GenesisProposer)
-
-		// Defensive check: Ensure genesis block was actually created
-		if genesis == nil {
-			log.Printf("[NewBlockchain] CRITICAL ERROR: NewGenesisBlock returned nil for Shard %d", shardID)
-			bc.ChainMu.Unlock() // Unlock before returning error
-			return nil, fmt.Errorf("genesis block creation failed (returned nil) for shard %d", shardID)
-		}
-
-		// Assign the genesis block to the map
-		bc.BlockChains[shardID] = []*Block{genesis}
-
-		// Add log to confirm assignment and length immediately after
-		log.Printf("[NewBlockchain] Assigned genesis to bc.BlockChains[%d]. Map entry length: %d", shardID, len(bc.BlockChains[shardID]))
-	}
-
-	log.Printf("[NewBlockchain] Finished genesis block loop. Releasing lock.")
-	bc.ChainMu.Unlock() // Unlock *after* the loop finishes, before returning
-	// --------------------------------------------------------------------
-
-	log.Printf("[NewBlockchain] Initialization complete. Returning Blockchain instance.")
-	return bc, nil
+	return bc, nil // Return blockchain and nil error
 }
 
-// AddTransaction - Routing logic remains mostly the same.
-// dBFT interaction happens during block creation, not transaction submission.
+// Start begins the blockchain's background processes (like shard management).
+func (bc *Blockchain) Start() {
+	// Start Consistency Manager monitoring
+	bc.wg.Add(1)
+	go bc.ConsistencyManager.Start() // Adjusted to match the method's definition
+	// Start Shard Manager monitoring
+	bc.wg.Add(1)
+	go bc.ShardManager.StartManagementLoop() // Replace Start with StartManagementLoop
+}
+
+// Stop gracefully shuts down the blockchain processes.
+func (bc *Blockchain) Stop() {
+	close(bc.stopChan)
+	bc.wg.Wait()
+	log.Println("[Blockchain] All background processes stopped.")
+}
+
+// AddTransaction routes a transaction to the appropriate shard using the ShardManager.
 func (bc *Blockchain) AddTransaction(tx *Transaction) error {
-	// Route CrossShardTxInit to source shard (if specified)
-	if tx.Type == CrossShardTxInit && tx.SourceShard != nil {
-		shardID := *tx.SourceShard
-		shard, ok := bc.ShardManager.GetShard(shardID)
-		if !ok {
-			// Fallback routing if source shard doesn't exist (e.g., after merge)
-			fallbackShardID, err := bc.ShardManager.DetermineShard(tx.ID)
-			if err != nil {
-				return fmt.Errorf("source shard %d not found and failed to determine fallback for tx %x: %w", shardID, tx.ID, err)
-			}
-			shard, ok = bc.ShardManager.GetShard(fallbackShardID)
-			if !ok {
-				return fmt.Errorf("source shard %d not found and fallback shard %d also not found for tx %x", shardID, fallbackShardID, tx.ID)
-			}
-			log.Printf("Warning: Source shard %d not found for tx %x, routing to fallback shard %d", shardID, tx.ID, fallbackShardID)
-			// Update the transaction's source shard field? Or let processor handle it? Let processor handle.
-		}
-		return shard.AddTransaction(tx)
+	if tx == nil || tx.ID == nil {
+		return errors.New("cannot add nil or uninitialized transaction")
 	}
 
-	// Route other transactions based on consistent hashing of TX ID
-	targetShardID, err := bc.ShardManager.DetermineShard(tx.ID)
+	// Determine the target shard using the ShardManager's consistent hashing
+	// Use the transaction ID as the key for routing.
+	shardID, err := bc.ShardManager.DetermineShard(tx.ID)
 	if err != nil {
-		return fmt.Errorf("failed to determine shard for tx %x: %w", tx.ID, err)
-	}
-	shard, ok := bc.ShardManager.GetShard(targetShardID)
-	if !ok {
-		// Add fallback mechanism if shard disappears between determination and get
-		log.Printf("Warning: Target shard %d determined for tx %x but not found (race condition?). Retrying determination.", targetShardID, tx.ID)
-		time.Sleep(50 * time.Millisecond) // Small delay
-		retryShardID, retryErr := bc.ShardManager.DetermineShard(tx.ID)
-		if retryErr != nil {
-			return fmt.Errorf("failed to determine shard for tx %x on retry: %w", tx.ID, retryErr)
-		}
-		shard, ok = bc.ShardManager.GetShard(retryShardID)
-		if !ok {
-			return fmt.Errorf("determined shard %d (retry %d) not found for tx %x", targetShardID, retryShardID, tx.ID)
-		}
-		log.Printf("Successfully routed tx %x to shard %d on retry.", tx.ID, retryShardID)
-		targetShardID = retryShardID // Update targetShardID for logging consistency if needed
+		log.Printf("[Blockchain] Error determining shard for tx %x: %v", tx.ID, err)
+		// Decide how to handle routing errors. Maybe route to a default shard or return error.
+		// Returning error is safer for now.
+		return fmt.Errorf("could not determine shard for transaction %x: %w", tx.ID, err)
 	}
 
-	// Add transaction to the determined shard's pool
+	// Get the shard using the determined ID
+	shard, ok := bc.ShardManager.GetShard(shardID) // GetShard returns (*Shard, bool)
+	if !ok {
+		// This indicates an inconsistency, as DetermineShard should only return active shard IDs.
+		log.Printf("[Blockchain] CRITICAL: DetermineShard routed tx %x to non-existent shard %d!", tx.ID, shardID)
+		// Attempt fallback routing or return a critical error.
+		// Fallback might involve re-determining or routing to shard 0 if it exists.
+		// Returning error for now.
+		return fmt.Errorf("determined shard %d for transaction %x does not exist in ShardManager", shardID, tx.ID)
+	}
+
+	log.Printf("[Blockchain] Routing transaction %x to shard %d", tx.ID, shardID)
+	// Add the transaction to the determined shard's pool
 	addErr := shard.AddTransaction(tx)
 	if addErr != nil {
-		log.Printf("Error adding TX %x to shard %d pool: %v", tx.ID, targetShardID, addErr)
-		return addErr
+		log.Printf("[Blockchain] Error adding transaction %x to shard %d pool: %v", tx.ID, shardID, addErr)
+		return fmt.Errorf("failed to add transaction %x to shard %d: %w", tx.ID, shardID, addErr)
 	}
-	// log.Printf("Routed TX %x (Type: %d) to shard %d", tx.ID, tx.Type, targetShardID)
+
 	return nil
 }
 
-// MineShardBlock performs the hybrid PoW/dBFT consensus process for a shard.
-func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
+// MineShardBlock coordinates the process of proposing and finalizing a block for a specific shard.
+func (bc *Blockchain) MineShardBlock(shardID uint64, proposerID NodeID) (*Block, error) {
 	shard, ok := bc.ShardManager.GetShard(shardID)
-	if !ok {
-		return nil, fmt.Errorf("shard %d not found", shardID)
+	if !ok { // Changed from checking err != nil to checking !ok
+		return nil, fmt.Errorf("could not get shard %d for mining", shardID)
 	}
 
-	// --- 1. Get Proposer Information ---
-	proposerNodeID := bc.LocalNodeID // Assume this node instance is the proposer
-	if proposerNodeID == "" {
-		return nil, errors.New("cannot propose block: local node ID is not set")
-	}
-	proposer, ok := bc.ValidatorMgr.GetValidator(proposerNodeID)
-	if !ok {
-		log.Printf("Warning: Node %s proposing for shard %d is not a registered validator.", proposerNodeID, shardID)
-		proposer = &Validator{Node: &Node{ID: proposerNodeID}} // Temporary, won't be in manager
-		proposer.Node.Authenticate()                           // Assume authenticated for simulation
-	}
+	// 1. Get Transactions and Previous Block Info
+	transactions := shard.GetTransactionsForBlock(10) // Assuming max 10 TXs per block
 
-	// --- 2. Select Transactions & Handle Cross-Shard ---
-	maxTxPerBlock := 10
-	txsRaw := shard.GetTransactionsForBlock(maxTxPerBlock)
-	transactionsForProposal := make([]*Transaction, 0, len(txsRaw))
-
-	for _, tx := range txsRaw {
-		if tx.Type == CrossShardTxInit && tx.SourceShard != nil && tx.DestinationShard != nil {
-			if *tx.SourceShard != shardID {
-				log.Printf("Error: CrossShardTxInit %x found in shard %d, but SourceShard field is %d. Re-routing or discarding.", tx.ID, shardID, *tx.SourceShard)
-				continue
-			}
-
-			log.Printf("Shard %d: Processing cross-shard init Tx %x for dest %d", shardID, tx.ID, *tx.DestinationShard)
-			receipt := &CrossShardReceipt{
-				SourceShard:      *tx.SourceShard,
-				DestinationShard: *tx.DestinationShard,
-				TransactionID:    tx.ID,
-				Data:             tx.Data,
-			}
-			finalizeTx := NewTransaction(receipt.Data, CrossShardTxFinalize, &receipt.DestinationShard)
-			finalizeTx.SourceShard = &receipt.SourceShard
-			finalizeTx.SourceReceiptProof = &ReceiptProof{MerkleProof: [][]byte{receipt.TransactionID}}
-
-			destShard, destOk := bc.ShardManager.GetShard(receipt.DestinationShard)
-			if destOk {
-				err := destShard.AddTransaction(finalizeTx)
-				if err != nil {
-					log.Printf("Shard %d: Error routing cross-shard finalize tx %x to shard %d: %v", shardID, finalizeTx.ID, receipt.DestinationShard, err)
-				} else {
-					log.Printf("Shard %d: Routed finalize tx %x for %x to dest shard %d", shardID, finalizeTx.ID, tx.ID, receipt.DestinationShard)
-				}
-			} else {
-				log.Printf("Shard %d: Cannot route finalize tx %x for %x, dest shard %d not found", shardID, finalizeTx.ID, tx.ID, receipt.DestinationShard)
-				log.Printf("Shard %d: Discarding cross-shard init Tx %x due to missing destination shard %d", shardID, tx.ID, *tx.DestinationShard)
-				continue
-			}
-			transactionsForProposal = append(transactionsForProposal, tx)
-
-		} else if tx.Type == CrossShardTxFinalize {
-			if tx.DestinationShard == nil || *tx.DestinationShard != shardID {
-				// Simplified log message to try and resolve persistent format error.
-				log.Printf("Error: CrossShardTxFinalize %x in shard %d has incorrect/missing DestinationShard. Discarding.", tx.ID, shardID)
-				continue
-			}
-			log.Printf("Shard %d: Including cross-shard finalize Tx %x", shardID, tx.ID)
-			transactionsForProposal = append(transactionsForProposal, tx)
-		} else if tx.Type == IntraShard {
-			transactionsForProposal = append(transactionsForProposal, tx)
-		} else {
-			log.Printf("Shard %d: Skipping transaction %x with unknown type %d", shardID, tx.ID, tx.Type)
-		}
-	}
-
+	// Get previous block hash and height from the blockchain's map
 	bc.ChainMu.RLock()
-	shardChain, chainOk := bc.BlockChains[shardID]
+	chain, chainExists := bc.BlockChains[shardID]
+	var prevBlockHash []byte
+	var prevBlockHeight uint64 = 0                  // Genesis block is height 0
+	var prevBlockVC VectorClock = make(VectorClock) // Start with empty VC for genesis
+	if chainExists && len(chain) > 0 {
+		lastBlock := chain[len(chain)-1]
+		prevBlockHash = lastBlock.Hash
+		prevBlockHeight = lastBlock.Header.Height
+		prevBlockVC = lastBlock.Header.VectorClock // Get VC from previous block header
+	} else {
+		// This is the first block (genesis) for this shard
+		log.Printf("[Blockchain] Shard %d: No previous block found, proposing genesis block (Height 0).", shardID)
+		// Genesis block doesn't need PoW in the same way, handle separately?
+		// For now, let ProposeBlock handle height 0.
+	}
 	bc.ChainMu.RUnlock()
 
-	if !chainOk || len(shardChain) == 0 {
-		err := bc.initializeShardChain(shardID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize chain for shard %d: %w", shardID, err)
-		}
-		bc.ChainMu.RLock()
-		shardChain, chainOk = bc.BlockChains[shardID]
-		bc.ChainMu.RUnlock()
-		if !chainOk || len(shardChain) == 0 {
-			return nil, fmt.Errorf("shard %d chain initialization failed or chain empty", shardID)
-		}
-	}
-
-	bc.ChainMu.RLock()
-	prevBlock := shardChain[len(shardChain)-1]
-	bc.ChainMu.RUnlock()
-	newHeight := prevBlock.Header.Height + 1
-
-	stateRoot, err := shard.ApplyStateChanges(transactionsForProposal)
+	// Apply state changes *before* calculating the final state root for the block
+	finalStateRoot, err := shard.ApplyStateChanges(transactions)
 	if err != nil {
-		return nil, fmt.Errorf("failed to apply state changes for shard %d, block %d: %w", shardID, newHeight, err)
+		// If state application fails, we probably shouldn't mine the block
+		log.Printf("[Blockchain] Shard %d: Failed to apply state changes for new block: %v. Aborting mining.", shardID, err)
+		return nil, fmt.Errorf("failed to apply state changes for shard %d: %w", shardID, err)
 	}
 
-	proposedBlock, err := ProposeBlock(shardID, transactionsForProposal, prevBlock.Hash, newHeight, stateRoot, bc.Difficulty, proposerNodeID, prevBlock.Header.VectorClock)
+	// 2. Propose Block (Create Header, Run PoW)
+	// Use the core ProposeBlock function which handles header creation, Merkle root, Bloom filter, VC, accumulator, and PoW.
+	// Pass the state root calculated *after* applying transactions.
+	newBlock, err := ProposeBlock(shardID, transactions, prevBlockHash, prevBlockHeight+1, finalStateRoot, bc.Config.PoWDifficulty, proposerID, prevBlockVC)
 	if err != nil {
-		log.Printf("Shard %d: Failed to propose block H:%d: %v", shardID, newHeight, err)
-		return nil, fmt.Errorf("block proposal failed for shard %d: %w", shardID, err)
+		return nil, fmt.Errorf("failed to propose block for shard %d: %w", shardID, err)
+	}
+	// ProposeBlock already runs PoW and sets Nonce and Hash.
+
+	log.Printf("[Blockchain] Shard %d: Block proposed by %s. Hash: %x, Nonce: %d, Height: %d, StateRoot: %x",
+		shardID, proposerID, safeSlice(newBlock.Hash, 4), newBlock.Header.Nonce, newBlock.Header.Height, safeSlice(newBlock.Header.StateRoot, 4))
+
+	// 3. Finalize Block (dBFT)
+	// Ensure err is declared correctly here
+	var signedBlock *SignedBlock
+	signedBlock, err = bc.ValidatorManager.FinalizeBlockDBFT(newBlock, shardID) // Correct assignment
+	if err != nil {
+		log.Printf("[Blockchain] Shard %d: Block H:%d Hash:%x proposed by %s FAILED dBFT: %v",
+			shardID, newBlock.Header.Height, safeSlice(newBlock.Hash, 4), proposerID, err)
+		bc.ValidatorManager.UpdateReputation(proposerID, DbftConsensusPenalty) // Use constant
+		return nil, fmt.Errorf("block finalization failed for shard %d: %w", shardID, err)
 	}
 
-	currentConsistencyLevel := bc.Consistency.GetCurrentLevel()
-	log.Printf("Shard %d: Running consensus with %s consistency level.", shardID, currentConsistencyLevel)
+	// Ensure the block returned by dBFT is the one we use
+	finalizedBlock := signedBlock.Block // This block now contains FinalitySignatures in its header
 
-	consensusReached, agreeingValidators := bc.ValidatorMgr.SimulateDBFT(
-		proposedBlock,
-		proposer,
-		currentConsistencyLevel,
-		bc.Consistency,
-	)
-
-	if !consensusReached {
-		log.Printf("Shard %d: Consensus failed for proposed block H:%d under %s consistency. Discarding block.",
-			shardID, newHeight, currentConsistencyLevel)
-		return nil, fmt.Errorf("dBFT consensus failed (%s level)", currentConsistencyLevel)
-	}
-
-	proposedBlock.Finalize(agreeingValidators)
-
-	if !ValidateBlockIntegrity(proposedBlock, prevBlock, bc.ValidatorMgr) {
-		log.Printf("Shard %d: CRITICAL - Finalized block H:%d failed integrity validation!", shardID, newHeight)
-		return nil, fmt.Errorf("finalized block %d failed integrity check", newHeight)
-	}
-
+	// 4. Add Finalized Block to Shard Chain (in Blockchain map) & Update Metrics
 	bc.ChainMu.Lock()
-	bc.BlockChains[shardID] = append(bc.BlockChains[shardID], proposedBlock)
-	currentHeight := proposedBlock.Header.Height
+	if _, exists := bc.BlockChains[shardID]; !exists {
+		bc.BlockChains[shardID] = make([]*Block, 0)
+		log.Printf("[Blockchain] Initialized chain storage for new shard %d.", shardID)
+	}
+	// Basic validation: check if parent exists (unless genesis)
+	if finalizedBlock.Header.Height > 0 {
+		currentChain := bc.BlockChains[shardID]
+		if len(currentChain) == 0 || !bytes.Equal(currentChain[len(currentChain)-1].Hash, finalizedBlock.Header.PrevBlockHash) {
+			bc.ChainMu.Unlock()
+			log.Printf("[Blockchain] CRITICAL: Shard %d: Proposed block H:%d (Prev: %x) does not link to current chain head (H:%d, Hash:%x). Discarding.",
+				shardID, finalizedBlock.Header.Height, safeSlice(finalizedBlock.Header.PrevBlockHash, 4),
+				currentChain[len(currentChain)-1].Header.Height, safeSlice(currentChain[len(currentChain)-1].Hash, 4))
+			return nil, fmt.Errorf("proposed block for shard %d does not link to chain head", shardID)
+		}
+	}
+	bc.BlockChains[shardID] = append(bc.BlockChains[shardID], finalizedBlock)
+	chainLen := len(bc.BlockChains[shardID])
 	bc.ChainMu.Unlock()
 
-	bc.Mu.Lock()
-	if int(currentHeight) > bc.ChainHeight {
-		bc.ChainHeight = int(currentHeight)
-	}
-	bc.Mu.Unlock()
-
+	// Update shard metrics
 	shard.Metrics.BlockCount.Add(1)
 
-	log.Printf("Shard %d: ===> Successfully Proposed, Finalized, and Added Block H:%d. Hash: %x... VC: %v <===",
-		shardID, newHeight, safeSlice(proposedBlock.Hash, 4), proposedBlock.Header.VectorClock)
+	log.Printf("[Blockchain] Shard %d: Block H:%d Hash:%x successfully mined and added to chain (Chain Length: %d).",
+		shardID, finalizedBlock.Header.Height, safeSlice(finalizedBlock.Hash, 4), chainLen)
 
-	return proposedBlock, nil
+	// Reward proposer for successful block
+	bc.ValidatorManager.UpdateReputation(proposerID, DbftConsensusReward) // Use constant
+
+	// 5. Prune old state/blocks if necessary
+	bc.PruneChain(shardID, bc.Config.PruneKeepBlocks) // Use configured value
+
+	// Update overall chain height (simple max height tracking)
+	bc.mu.Lock()
+	if int(finalizedBlock.Header.Height) > bc.ChainHeight {
+		bc.ChainHeight = int(finalizedBlock.Header.Height)
+	}
+	bc.mu.Unlock()
+
+	return finalizedBlock, nil
 }
 
-// initializeShardChain creates a genesis block for a shard and initializes its blockchain
-// Uses the Blockchain's GenesisProposer ID.
-func (bc *Blockchain) initializeShardChain(shardID uint64) error {
-	if _, ok := bc.ShardManager.GetShard(shardID); !ok {
-		return fmt.Errorf("cannot initialize chain: shard %d not found in shard manager", shardID)
+// GetBlock retrieves a block from a specific shard's chain.
+func (bc *Blockchain) GetBlock(shardID uint64, blockHash []byte) (*Block, error) {
+	bc.ChainMu.RLock()
+	defer bc.ChainMu.RUnlock()
+
+	chain, ok := bc.BlockChains[shardID]
+	if !ok {
+		return nil, fmt.Errorf("shard %d chain not found", shardID)
+	}
+
+	for i := len(chain) - 1; i >= 0; i-- { // Search backwards for efficiency
+		if bytes.Equal(chain[i].Hash, blockHash) {
+			return chain[i], nil
+		}
+	}
+
+	return nil, fmt.Errorf("block %x not found in shard %d chain", blockHash, shardID)
+}
+
+// GetLatestBlock retrieves the latest block from a specific shard's chain.
+func (bc *Blockchain) GetLatestBlock(shardID uint64) (*Block, error) {
+	bc.ChainMu.RLock()
+	defer bc.ChainMu.RUnlock()
+
+	chain, ok := bc.BlockChains[shardID]
+	if !ok || len(chain) == 0 {
+		return nil, fmt.Errorf("shard %d chain not found or is empty", shardID)
+	}
+	return chain[len(chain)-1], nil
+}
+
+// GetState retrieves a value from the state DB of a specific shard.
+func (bc *Blockchain) GetState(shardID uint64, key string) ([]byte, error) {
+	shard, ok := bc.ShardManager.GetShard(shardID)
+	if !ok {
+		return nil, fmt.Errorf("could not get shard %d to retrieve state", shardID)
+	}
+	// Use StateDB field
+	value, err := shard.StateDB.Get(key) // Pass key as string
+	if err != nil {
+		// Don't wrap "key not found" errors necessarily, depends on desired behavior
+		// return nil, fmt.Errorf("failed to get key '%s' from shard %d state: %w", key, shardID, err)
+		return nil, err // Return original error (e.g., key not found)
+	}
+	return value, nil
+}
+
+// PruneChain removes old blocks from a specific shard's chain in memory.
+func (bc *Blockchain) PruneChain(shardID uint64, minBlocksToKeep int) {
+	if minBlocksToKeep <= 0 {
+		return // Pruning disabled or invalid config
 	}
 
 	bc.ChainMu.Lock()
 	defer bc.ChainMu.Unlock()
 
-	if _, exists := bc.BlockChains[shardID]; exists {
-		return nil
-	}
-
-	log.Printf("Initializing chain for dynamically added Shard %d...", shardID)
-	genesis := NewGenesisBlock(shardID, nil, bc.Difficulty, bc.GenesisProposer)
-
-	bc.BlockChains[shardID] = []*Block{genesis}
-
-	log.Printf("Created Genesis Block for Shard %d by %s\n", shardID, bc.GenesisProposer)
-	return nil
-}
-
-// GetLatestBlock remains the same.
-func (bc *Blockchain) GetLatestBlock(shardID uint64) (*Block, error) {
-	bc.ChainMu.RLock()
-	defer bc.ChainMu.RUnlock()
-	shardChain, ok := bc.BlockChains[shardID]
+	chain, ok := bc.BlockChains[shardID]
 	if !ok {
-		return nil, fmt.Errorf("shard %d chain not found", shardID)
+		// log.Printf("[Prune] Shard %d: Chain not found, skipping.", shardID)
+		return
 	}
-	if len(shardChain) == 0 {
-		return nil, fmt.Errorf("shard %d chain is empty", shardID)
+
+	currentLen := len(chain)
+	if currentLen <= minBlocksToKeep {
+		// log.Printf("[Prune] Shard %d: Chain length %d <= %d, no pruning needed.", shardID, currentLen, minBlocksToKeep)
+		return // Not enough blocks to prune
 	}
-	return shardChain[len(shardChain)-1], nil
+
+	prunedCount := currentLen - minBlocksToKeep
+	bc.BlockChains[shardID] = chain[prunedCount:] // Keep the last 'minBlocksToKeep' blocks
+
+	newLen := len(bc.BlockChains[shardID])
+	firstBlockHeight := uint64(0)
+	lastBlockHeight := uint64(0)
+	if newLen > 0 {
+		firstBlockHeight = bc.BlockChains[shardID][0].Header.Height
+		lastBlockHeight = bc.BlockChains[shardID][newLen-1].Header.Height
+	}
+
+	log.Printf("[Prune] Shard %d: Pruned %d blocks. New length: %d (Keeping H:%d to H:%d).",
+		shardID, prunedCount, newLen, firstBlockHeight, lastBlockHeight)
+
+	// TODO: State pruning would need to happen here too, based on the oldest kept block's state root.
 }
 
-// GetBlock remains the same (inefficient search).
-func (bc *Blockchain) GetBlock(hash []byte) (*Block, error) {
-	bc.ChainMu.RLock()
-	defer bc.ChainMu.RUnlock()
-	for _, chain := range bc.BlockChains {
-		for _, block := range chain {
-			if bytes.Equal(block.Hash, hash) {
-				return block, nil
-			}
-		}
-	}
-	return nil, fmt.Errorf("block with hash %x not found in any shard", hash)
+// DisplayReputations logs the current reputation scores of all validators.
+func (bc *Blockchain) DisplayReputations() {
+	// Check consensus.go content - assuming LogReputations exists
+	bc.ValidatorManager.LogReputations() // Changed from DisplayReputations
 }
 
-// ValidateBlockIntegrity includes checks for proposer, finality, and vector clock causality.
-func ValidateBlockIntegrity(newBlock, prevBlock *Block, vm *ValidatorManager) bool {
-	if newBlock == nil || prevBlock == nil {
-		log.Println("Validation Error: Cannot validate nil blocks.")
-		return false
+// Helper function to safely slice byte arrays for logging
+func safeSlice(data []byte, length int) []byte {
+	if len(data) < length {
+		return data
 	}
-	if newBlock.Header.ShardID != prevBlock.Header.ShardID {
-		log.Printf("Validation Error: Block %d ShardID (%d) mismatch Prev Block %d ShardID (%d)",
-			newBlock.Header.Height, newBlock.Header.ShardID, prevBlock.Header.Height, prevBlock.Header.ShardID)
-		return false
-	}
-	if !bytes.Equal(newBlock.Header.PrevBlockHash, prevBlock.Hash) {
-		// Simplified log message to address persistent format error
-		log.Printf("Validation Error: Shard %d Block %d PrevBlockHash mismatch.",
-			newBlock.Header.ShardID, newBlock.Header.Height)
-		return false
-	}
-	if newBlock.Header.Height != prevBlock.Header.Height+1 {
-		log.Printf("Validation Error: Shard %d Block %d Height (%d) not sequential to Block %d Height (%d)",
-			newBlock.Header.ShardID, newBlock.Header.Height, newBlock.Header.Height, prevBlock.Header.Height)
-		return false
-	}
-
-	if newBlock.Header.ProposerID == "" {
-		log.Printf("Validation Error: Shard %d Block %d has empty ProposerID.", newBlock.Header.ShardID, newBlock.Header.Height)
-		return false
-	}
-	proposer, exists := vm.GetValidator(newBlock.Header.ProposerID)
-	if !exists {
-	} else if !proposer.Node.IsAuthenticated.Load() {
-		log.Printf("Validation Error: Proposer %s for Shard %d Block %d is not authenticated.", newBlock.Header.ProposerID, newBlock.Header.ShardID, newBlock.Header.Height)
-		return false
-	}
-
-	isGenesis := newBlock.Header.Height == 0
-	if !isGenesis && len(newBlock.Header.FinalitySignatures) == 0 {
-		log.Printf("Validation Error: Shard %d Block %d (non-genesis) has no finality signatures.", newBlock.Header.ShardID, newBlock.Header.Height)
-		return false
-	}
-
-	comparison := newBlock.Header.VectorClock.Compare(prevBlock.Header.VectorClock)
-	if comparison == -1 {
-		log.Printf("Validation Error: Shard %d Block %d VectorClock (%v) is causally BEFORE previous block (%v).",
-			newBlock.Header.ShardID, newBlock.Header.Height, newBlock.Header.VectorClock, prevBlock.Header.VectorClock)
-		return false
-	}
-	newShardEntry := newBlock.Header.VectorClock[newBlock.Header.ShardID]
-	prevShardEntry := prevBlock.Header.VectorClock[prevBlock.Header.ShardID]
-	if newShardEntry != prevShardEntry+1 {
-		log.Printf("Validation Error: Shard %d Block %d VectorClock entry for shard %d (%d) was not incremented correctly from previous block (%d).",
-			newBlock.Header.ShardID, newBlock.Header.Height, newBlock.Header.ShardID, newShardEntry, prevShardEntry)
-		return false
-	}
-	for shardID, prevVal := range prevBlock.Header.VectorClock {
-		if shardID == newBlock.Header.ShardID {
-			continue
-		}
-		newVal, ok := newBlock.Header.VectorClock[shardID]
-		if !ok || newVal < prevVal {
-			log.Printf("Validation Error: Shard %d Block %d VectorClock entry for other shard %d (%d) is less than previous block's entry (%d).",
-				newBlock.Header.ShardID, newBlock.Header.Height, shardID, newVal, prevVal)
-			return false
-		}
-	}
-
-	return true
-}
-
-// IsChainValid checks the integrity of the entire blockchain across all shards.
-func (bc *Blockchain) IsChainValid() bool {
-	bc.ChainMu.RLock()
-	defer bc.ChainMu.RUnlock()
-	overallValid := true
-
-	var wg sync.WaitGroup
-	errorChan := make(chan error, len(bc.BlockChains))
-
-	chainsToValidate := make(map[uint64][]*Block)
-	for id, chain := range bc.BlockChains {
-		copiedChain := make([]*Block, len(chain))
-		copy(copiedChain, chain)
-		chainsToValidate[id] = copiedChain
-	}
-
-	// Corrected loop syntax: added 'range'
-	for shardID, chain := range chainsToValidate {
-		wg.Add(1)
-		go func(sID uint64, ch []*Block, vm *ValidatorManager) {
-			defer wg.Done()
-			if len(ch) == 0 {
-				return
-			}
-
-			genesis := ch[0]
-			powGenesis := NewProofOfWork(genesis)
-			if !powGenesis.Validate() {
-				errorChan <- fmt.Errorf("shard %d genesis PoW validation failed (Hash: %x)", sID, genesis.Hash)
-				return
-			}
-			if genesis.Header.ProposerID == "" {
-				errorChan <- fmt.Errorf("shard %d genesis block has empty ProposerID", sID)
-				return
-			}
-			if len(genesis.Header.FinalitySignatures) == 0 {
-				errorChan <- fmt.Errorf("shard %d genesis block has no finality signatures", sID)
-				return
-			}
-			if genesis.Header.VectorClock == nil || genesis.Header.VectorClock[sID] != 1 {
-				errorChan <- fmt.Errorf("shard %d genesis block has invalid vector clock: %v", sID, genesis.Header.VectorClock)
-				return
-			}
-
-			if len(ch) == 1 {
-				return
-			}
-
-			for i := 1; i < len(ch); i++ {
-				currentBlock := ch[i]
-				prevBlock := ch[i-1]
-
-				pow := NewProofOfWork(currentBlock)
-				if !pow.Validate() {
-					errorChan <- fmt.Errorf("shard %d PoW validation failed for Block H:%d (Hash: %x)", sID, currentBlock.Header.Height, currentBlock.Hash)
-					return // Stop validation for this shard on error
-				}
-
-				if !ValidateBlockIntegrity(currentBlock, prevBlock, vm) {
-					// Error details are logged within ValidateBlockIntegrity
-					errorChan <- fmt.Errorf("shard %d integrity validation failed between Block H:%d and H:%d", sID, prevBlock.Header.Height, currentBlock.Header.Height)
-					return // Stop validation for this shard on error
-				}
-
-				// TODO: Define and implement CalculateMerkleRoot(transactions []*Transaction) probably in merkle.go
-				/*
-					calculatedMerkleRoot, err := CalculateMerkleRoot(currentBlock.Transactions)
-					if err != nil {
-						log.Printf("  Shard %d - Block %d: Error calculating Merkle root: %v", sID, i, err)
-						errorChan <- fmt.Errorf("shard %d merkle root calculation error for Block H:%d: %w", sID, currentBlock.Header.Height, err)
-						// Decide whether to return or just mark as invalid and continue checking other blocks
-						// For now, let's mark overall as invalid but don't return immediately from the goroutine
-						overallValid = false // This assignment within goroutine needs careful handling (e.g., atomic bool or sending invalid signal)
-										 // Simplification: Rely on errorChan to signal failure.
-					} else if !bytes.Equal(calculatedMerkleRoot, currentBlock.Header.MerkleRoot) {
-						log.Printf("  Shard %d - Block %d: Invalid Merkle Root. Expected %x, Got %x",
-							sID, i, currentBlock.Header.MerkleRoot, calculatedMerkleRoot)
-						errorChan <- fmt.Errorf("shard %d invalid merkle root for Block H:%d", sID, currentBlock.Header.Height)
-						// overallValid = false // Mark as invalid
-					}
-				*/
-			}
-		}(shardID, chain, bc.ValidatorMgr)
-	}
-
-	wg.Wait()
-	close(errorChan)
-
-	errCount := 0
-	for err := range errorChan {
-		if err != nil {
-			log.Printf("- Validation Error: %v", err)
-			overallValid = false
-			errCount++
-		}
-	}
-
-	if overallValid {
-		log.Println("All shard chains validated successfully. Blockchain is valid.")
-	} else {
-		log.Printf("Blockchain validation failed. %d errors found.", errCount)
-	}
-
-	return overallValid
-}
-
-// PruneChain remains the same conceptual placeholder.
-func (bc *Blockchain) PruneChain(pruneHeight int) {
-	log.Println("Placeholder: Pruning logic finished (simplified).")
-}
-
-// GetShardChain remains the same.
-func (bc *Blockchain) GetShardChain(shardID uint64) []*Block {
-	return nil
+	return data[:length]
 }

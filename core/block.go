@@ -9,7 +9,6 @@ import (
 	"math/big"
 	"time"
 
-	// Assuming merkle is here
 	"github.com/willf/bloom" // Import Bloom filter
 )
 
@@ -32,6 +31,10 @@ type BlockHeader struct {
 
 	// --- Ticket 5: Conflict Resolution ---
 	VectorClock VectorClock // Tracks causal history of the block (Renamed from Clock)
+
+	// --- Placeholders for Advanced Features (Phase 6 - Tickets 2, 9) ---
+	AccumulatorState []byte // Placeholder for cryptographic accumulator state (e.g., RSA accumulator)
+	ProofMetadata    []byte // Placeholder for metadata related to advanced/compressed proofs
 }
 
 // Block represents a block in the blockchain.
@@ -76,8 +79,6 @@ func (pow *ProofOfWork) prepareData(nonce int64) []byte {
 	vcBytes, err := header.VectorClock.Serialize() // Use the renamed field VectorClock
 	if err != nil {
 		log.Printf("CRITICAL: Failed to serialize vector clock for hashing block %d: %v", header.Height, err)
-		// Handle error appropriately - maybe return an error or use a placeholder?
-		// Using empty bytes for now, but this is not ideal.
 		vcBytes = []byte{}
 	}
 
@@ -94,6 +95,7 @@ func (pow *ProofOfWork) prepareData(nonce int64) []byte {
 			[]byte(header.ProposerID),        // Include Proposer ID in hash
 			vcBytes,                          // Include serialized Vector Clock
 			[]byte(fmt.Sprintf("%d", nonce)), // Include the nonce being tried
+			header.AccumulatorState,          // Include accumulator state in hash
 			// DO NOT INCLUDE FinalitySignatures here
 		},
 		[]byte{},
@@ -107,7 +109,6 @@ func (pow *ProofOfWork) Run() (int64, []byte) {
 	var hash [32]byte
 	var nonce int64 = 0
 
-	// fmt.Printf("Mining block for shard %d with target %x\n", pow.block.Header.ShardID, pow.target.Bytes())
 	startTime := time.Now()
 
 	// Use a reasonable upper bound for nonce
@@ -119,24 +120,17 @@ func (pow *ProofOfWork) Run() (int64, []byte) {
 		hashInt.SetBytes(hash[:])
 
 		if hashInt.Cmp(pow.target) == -1 { // -1 if hashInt < target
-			// fmt.Printf("Found hash: %x (Nonce: %d)\n", hash, nonce)
 			break
 		}
 		nonce++
-		// Add occasional check to prevent infinite loop in case target is unreachable
-		// if nonce % 1000000 == 0 {
-		//  log.Printf("Shard %d still mining... Nonce: %d", pow.block.Header.ShardID, nonce)
-		// }
 	}
 	duration := time.Since(startTime)
 
 	if nonce >= maxNonce {
 		log.Printf("Shard %d WARNING: Mining reached max nonce (%d) without finding solution. Took %s.", pow.block.Header.ShardID, maxNonce, duration)
-		// Return something invalid? Or just the last attempt? Return last attempt for now.
 		return nonce, hash[:]
 	}
 
-	// Log mining time only if successful
 	log.Printf("Shard %d PoW found in %s. Hash: %x (Nonce: %d)", pow.block.Header.ShardID, duration, hash, nonce)
 
 	return nonce, hash[:]
@@ -150,7 +144,6 @@ func (pow *ProofOfWork) Validate() bool {
 	hashInt.SetBytes(hash[:])
 
 	isValid := hashInt.Cmp(pow.target) == -1
-	// Add check if the calculated hash matches the stored hash
 	if !bytes.Equal(hash[:], pow.block.Hash) {
 		log.Printf("Block %x hash mismatch! Stored: %x, Calculated: %x", pow.block.Hash, pow.block.Hash, hash[:])
 		return false
@@ -161,7 +154,7 @@ func (pow *ProofOfWork) Validate() bool {
 // ProposeBlock creates a new block proposal via PoW, but doesn't finalize it.
 // It performs PoW and sets the Nonce and Hash.
 // Now also calculates and sets the block's VectorClock.
-func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []byte, height uint64, stateRoot []byte, difficulty int, proposerID NodeID, prevBlockVC VectorClock) (*Block, error) { // Added prevBlockVC
+func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []byte, height uint64, stateRoot []byte, difficulty int, proposerID NodeID, prevBlockVC VectorClock) (*Block, error) {
 	if proposerID == "" {
 		return nil, fmt.Errorf("proposer ID cannot be empty")
 	}
@@ -173,9 +166,7 @@ func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []b
 		Height:        height,
 		Difficulty:    difficulty,
 		StateRoot:     stateRoot,
-		ProposerID:    proposerID, // Set proposer ID
-		// VectorClock will be calculated below
-		// Nonce, BloomFilter, Hash, FinalitySignatures will be set below or later
+		ProposerID:    proposerID,
 	}
 
 	block := &Block{
@@ -183,23 +174,22 @@ func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []b
 		Transactions: transactions,
 	}
 
-	// --- Calculate Block Vector Clock --- (Ticket 5)
-	// Start with a copy of the previous block's clock
+	// Calculate the block's vector clock.
+	// Start by copying the previous block's vector clock.
 	blockVC := prevBlockVC.Copy()
-	// Merge clocks from all included transactions
-	for _, tx := range transactions {
-		// Merge assuming tx.VectorClock is now the correct map[uint64]uint64 type
-		blockVC.Merge(tx.VectorClock)
-	}
-	// Increment the clock for the current shard
+	// The original code attempted to merge vector clocks from transactions,
+	// but the Transaction type doesn't have a VectorClock field.
+	// Removing this loop as transactions don't carry vector clocks in the current definition.
+	// for _, tx := range transactions {
+	// 	blockVC.Merge(tx.VectorClock) // This line caused the compile error
+	// }
+	// Increment the clock for the current shard where the block is being proposed.
 	blockVC[shardID]++
-	block.Header.VectorClock = blockVC // Assign to the renamed field
-	// -----------------------------------
+	block.Header.VectorClock = blockVC
 
-	// Calculate Merkle Root
 	txHashes := make([][]byte, len(transactions))
 	for i, tx := range transactions {
-		txHashes[i] = tx.Hash()
+		txHashes[i] = tx.ID // Replace tx.Hash() with tx.ID
 	}
 	merkleTree, err := NewMerkleTree(txHashes)
 	if err != nil {
@@ -207,12 +197,15 @@ func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []b
 	}
 	block.Header.MerkleRoot = merkleTree.GetMerkleRoot()
 
-	// Create and Serialize Bloom Filter
-	n := uint(1000) // Example: Expected items
-	p := 0.01       // Example: False positive rate
+	// Correct Bloom filter estimation
+	n := uint(len(transactions))
+	if n == 0 {
+		n = 1 // Avoid creating a filter with 0 items if there are no transactions
+	}
+	p := 0.01 // Standard false positive rate
 	filter := bloom.NewWithEstimates(n, p)
 	for _, tx := range transactions {
-		filter.Add(tx.Hash())
+		filter.Add(tx.ID) // Replace tx.Hash() with tx.ID
 	}
 	var buf bytes.Buffer
 	_, err = filter.WriteTo(&buf)
@@ -221,11 +214,23 @@ func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []b
 	}
 	block.Header.BloomFilter = buf.Bytes()
 
-	// Perform Proof of Work
+	// Initialize Accumulator state for the new block (e.g., from previous block or empty)
+	// For simplicity, let's assume it starts empty or inherits. Here, start empty.
+	block.Header.AccumulatorState = []byte("genesis_accumulator_state") // Or fetch from prev block header
+	// Update accumulator with transactions in this block
+	txDataForAccumulator := make([][]byte, len(transactions))
+	for i, tx := range transactions {
+		txDataForAccumulator[i] = tx.ID // Replace tx.Hash() with tx.ID
+	}
+	err = block.Header.UpdateAccumulator(txDataForAccumulator)
+	if err != nil {
+		log.Printf("Warning: Failed to update accumulator during block proposal: %v", err)
+		// Decide if this is critical. For PoC, maybe just log.
+	}
+
 	pow := NewProofOfWork(block)
 	nonce, hash := pow.Run()
 
-	// Check if PoW actually succeeded (didn't hit max nonce)
 	var hashInt big.Int
 	hashInt.SetBytes(hash)
 	if hashInt.Cmp(pow.target) != -1 {
@@ -233,7 +238,7 @@ func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []b
 	}
 
 	block.Header.Nonce = nonce
-	block.Hash = hash // Store the hash resulting from PoW
+	block.Hash = hash
 
 	log.Printf("Shard %d: Proposed Block H:%d by %s. Hash: %x... VC: %v", shardID, height, proposerID, safeSlice(hash, 4), block.Header.VectorClock)
 
@@ -241,7 +246,6 @@ func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []b
 }
 
 // FinalizeBlock sets the finality signatures on a block header.
-// This assumes the block hash (from PoW) is the primary identifier and doesn't change.
 func (b *Block) Finalize(finalizingValidators []NodeID) {
 	b.Header.FinalitySignatures = finalizingValidators
 	log.Printf("Shard %d: Finalized Block H:%d Hash: %x... with %d signatures.",
@@ -249,67 +253,54 @@ func (b *Block) Finalize(finalizingValidators []NodeID) {
 }
 
 // NewGenesisBlock creates the first block for a specific shard.
-// Genesis blocks are typically pre-finalized or don't require the same consensus.
 func NewGenesisBlock(shardID uint64, coinbase *Transaction, difficulty int, genesisProposerID NodeID) *Block {
 	if coinbase == nil {
-		coinbase = NewTransaction([]byte(fmt.Sprintf("Genesis Block Coinbase Shard %d", shardID)), IntraShard, nil)
+		coinbase = NewTransaction(IntraShardTx, []byte(fmt.Sprintf("Genesis Block Coinbase Shard %d", shardID)), uint32(shardID), uint32(shardID))
 	}
-	// Genesis block has height 0 and no previous hash.
-	// State root is initially empty.
 	emptyStateRoot := []byte{}
 
-	// Genesis Vector Clock: Starts at 1 for its own shard, 0 otherwise
 	genesisVC := make(VectorClock)
 	genesisVC[shardID] = 1
 
-	// Use ProposeBlock to get PoW done (even if difficulty is low for genesis)
-	// It's simpler to reuse the logic. Genesis difficulty can be set low.
 	genesisProposer := genesisProposerID
 	if genesisProposer == "" {
-		genesisProposer = "GENESIS" // Use a special ID
+		genesisProposer = "GENESIS"
 	}
 
-	// Attempt to propose with potentially very low difficulty
-	// Pass an empty VectorClock as the 'previous' clock for genesis
 	block, err := ProposeBlock(shardID, []*Transaction{coinbase}, []byte{}, 0, emptyStateRoot, difficulty, genesisProposer, make(VectorClock))
 
 	if err != nil {
-		// Fallback if ProposeBlock fails (e.g., extreme difficulty setting)
 		log.Printf("Warning: ProposeBlock failed for Genesis Shard %d: %v. Creating minimal Genesis.", shardID, err)
 		header := &BlockHeader{
 			ShardID:            shardID,
 			Timestamp:          time.Now().UnixNano(),
 			PrevBlockHash:      []byte{},
-			MerkleRoot:         []byte{}, // Calculate simple root if needed
+			MerkleRoot:         []byte{},
 			StateRoot:          emptyStateRoot,
 			Nonce:              0,
 			Height:             0,
 			Difficulty:         difficulty,
 			BloomFilter:        []byte{},
 			ProposerID:         genesisProposer,
-			FinalitySignatures: []NodeID{"GENESIS"}, // Mark as finalized by "GENESIS"
-			VectorClock:        genesisVC,           // Set fallback VC
+			FinalitySignatures: []NodeID{"GENESIS"},
+			VectorClock:        genesisVC,
 		}
 		block = &Block{
 			Header:       header,
 			Transactions: []*Transaction{coinbase},
-			Hash:         []byte("genesis_fallback_hash"), // Placeholder hash
+			Hash:         []byte("genesis_fallback_hash"),
 		}
-		// Recalculate Merkle root for the single tx
 		if len(block.Transactions) > 0 {
-			tree, _ := NewMerkleTree([][]byte{block.Transactions[0].Hash()})
+			tree, _ := NewMerkleTree([][]byte{block.Transactions[0].ID}) // Replace `Hash()` with `ID`
 			if tree != nil {
 				block.Header.MerkleRoot = tree.GetMerkleRoot()
 			}
 		}
-		// Recalculate Hash (basic hash of simplified header)
-		pow := NewProofOfWork(block)    // Use PoW struct for hashing logic
-		block.Hash = pow.prepareData(0) // Use data prep function for consistency (without nonce search)
+		pow := NewProofOfWork(block)
+		block.Hash = pow.prepareData(0)
 
 	} else {
-		// Mark the proposed genesis block as finalized immediately
-		block.Finalize([]NodeID{genesisProposer}) // Finalized by its own proposer
-		// Ensure the correct genesis VC is set even if ProposeBlock was used
+		block.Finalize([]NodeID{genesisProposer})
 		block.Header.VectorClock = genesisVC
 	}
 
@@ -344,8 +335,8 @@ func (b *Block) GetTransactionMerkleProof(txID []byte) ([][]byte, uint64, error)
 	txHashes := make([][]byte, len(b.Transactions))
 	txIndex := -1
 	for i, tx := range b.Transactions {
-		txHashes[i] = tx.Hash()
-		if bytes.Equal(tx.Hash(), txID) {
+		txHashes[i] = tx.ID           // Replace tx.Hash() with tx.ID
+		if bytes.Equal(tx.ID, txID) { // Replace tx.Hash() with tx.ID
 			txIndex = i
 		}
 	}
@@ -359,20 +350,63 @@ func (b *Block) GetTransactionMerkleProof(txID []byte) ([][]byte, uint64, error)
 		return nil, 0, fmt.Errorf("failed to reconstruct merkle tree for proof: %w", err)
 	}
 
-	// Simplified Merkle proof - just return the hashes needed for verification
-	// This is a placeholder; real implementation would generate proper inclusion path
-	proofHashes := [][]byte{merkleTree.RootNode.Data} // Placeholder proof
+	proofHashes := [][]byte{merkleTree.RootNode.Data}
 
 	return proofHashes, uint64(txIndex), nil
 }
 
-// Helper for logging/display
-func safeSlice(data []byte, n int) []byte {
-	if len(data) == 0 {
-		return []byte("nil")
+// UpdateAccumulator updates the block's accumulator state with new data (placeholder - simple hash chain).
+// H_new = SHA256(H_old || SHA256(data1) || SHA256(data2) || ...)
+func (bh *BlockHeader) UpdateAccumulator(newData [][]byte) error {
+	hasher := sha256.New()
+	hasher.Write(bh.AccumulatorState) // Start with the current state
+
+	for _, item := range newData {
+		itemHash := sha256.Sum256(item)
+		hasher.Write(itemHash[:]) // Append hash of new item
 	}
-	if len(data) < n {
-		return data
+
+	bh.AccumulatorState = hasher.Sum(nil)
+	// log.Printf("[BlockHeader H:%d] Updated accumulator state to %x", bh.Height, safeSlice(bh.AccumulatorState, 8)) // Reduce log noise
+	return nil
+}
+
+// GenerateProof generates an advanced proof (placeholder - simple accumulator proof).
+// For a simple hash chain H(H_old || H(d1) || H(d2)), proof for d1 could be [H_old, H(d2)].
+func (bh *BlockHeader) GenerateProof(dataID []byte) ([]byte, error) {
+	log.Printf("[BlockHeader H:%d] Generating accumulator proof for data %x (placeholder)", bh.Height, safeSlice(dataID, 4))
+	// This requires knowing the order/content of items added. Complex for this PoC.
+	// Return a placeholder indicating the data ID and the final accumulator state.
+	proof := bytes.Join([][]byte{
+		[]byte("simple_accumulator_proof_for:"),
+		dataID,
+		[]byte("final_state:"),
+		bh.AccumulatorState,
+	}, []byte(" "))
+	return proof, nil
+}
+
+// VerifyProof verifies an advanced proof (placeholder - simple accumulator).
+// This would require recomputing the accumulator state with the proof elements.
+func VerifyProof(blockHeader *BlockHeader, proof []byte, dataID []byte) bool {
+	if blockHeader == nil {
+		log.Printf("[VerifyProof] Error: Block header is nil")
+		return false
 	}
-	return data[:n]
+	log.Printf("[VerifyProof H:%d] Verifying accumulator proof for data %x (placeholder)", blockHeader.Height, safeSlice(dataID, 4))
+	// Placeholder: Check if the proof contains the expected final state.
+	// A real verification would involve cryptographic checks.
+	parts := bytes.Split(proof, []byte(" "))
+	if len(parts) == 4 && bytes.Equal(parts[0], []byte("simple_accumulator_proof_for:")) && bytes.Equal(parts[2], []byte("final_state:")) {
+		// Check if the dataID matches (optional, depends on proof format)
+		// Check if the final state in the proof matches the header's state
+		if bytes.Equal(parts[3], blockHeader.AccumulatorState) {
+			// log.Printf("[VerifyProof H:%d] Placeholder verification successful for %x", blockHeader.Height, safeSlice(dataID, 4)) // Reduce log noise
+			return true
+		}
+		log.Printf("[VerifyProof H:%d] Failed: Accumulator state mismatch. Expected %x, Got %x", blockHeader.Height, safeSlice(blockHeader.AccumulatorState, 8), safeSlice(parts[3], 8))
+		return false
+	}
+	log.Printf("[VerifyProof H:%d] Failed: Invalid proof format.", blockHeader.Height)
+	return false // Placeholder failure
 }

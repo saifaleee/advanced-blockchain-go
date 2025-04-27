@@ -1,58 +1,118 @@
 package core
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/hex"
-	"log"
-	"sync"
+	"fmt"
 	"sync/atomic"
+	"time"
 )
-
-// GenerateNodeID creates a random NodeID.
-func GenerateNodeID() NodeID {
-	bytes := make([]byte, 16) // 128 bits
-	_, _ = rand.Read(bytes)
-	return NodeID(hex.EncodeToString(bytes))
-}
 
 // Node represents a participant in the network.
 type Node struct {
-	ID              NodeID
-	PublicKey       []byte      // Placeholder for cryptographic public key
-	IsAuthenticated atomic.Bool // Simple flag for authentication status
-	// Add other node-specific details like network address if needed
+	ID             NodeID
+	PrivateKey     *ecdsa.PrivateKey
+	PublicKey      *ecdsa.PublicKey
+	Authentication *NodeAuthentication // Changed to pointer for atomic updates
+	TrustScore     float64             // Adaptive trust score
+	LastAttested   time.Time           // Timestamp of last successful attestation/challenge response
 }
 
-// NewNode creates a new basic node.
-func NewNode() *Node {
-	id := GenerateNodeID()
-	// Generate placeholder key
-	pk := make([]byte, 32)
-	_, _ = rand.Read(pk)
+// NodeAuthentication holds authentication-related state for a node.
+// Using atomic values for thread-safe updates.
+type NodeAuthentication struct {
+	IsAuthenticated atomic.Bool   // Use atomic.Bool
+	AuthNonce       atomic.Uint64 // Use atomic.Uint64 for nonce
+}
 
-	node := &Node{
-		ID:        id,
-		PublicKey: pk,
+// NewNode creates a new Node with ECDSA keys.
+// Returns Node and error.
+func NewNode(id NodeID) (*Node, error) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate ECDSA key for node %s: %w", id, err)
 	}
-	node.IsAuthenticated.Store(false) // Nodes need to authenticate
-	return node
+	node := &Node{
+		ID:             id,
+		PrivateKey:     privateKey,
+		PublicKey:      &privateKey.PublicKey,
+		Authentication: &NodeAuthentication{}, // Initialize authentication struct
+		TrustScore:     0.5,                   // Initial neutral trust score
+	}
+	// Initialize atomic values
+	node.Authentication.IsAuthenticated.Store(false) // Start as not authenticated
+	node.Authentication.AuthNonce.Store(0)
+	return node, nil
 }
 
-// Authenticate marks the node as authenticated (simple simulation).
+// SignData signs arbitrary data using the node's private key.
+// Assumes the input data is the hash that needs to be signed.
+func (n *Node) SignData(dataHash []byte) ([]byte, error) {
+	signature, err := ecdsa.SignASN1(rand.Reader, n.PrivateKey, dataHash) // Use dataHash directly
+	if err != nil {
+		return nil, fmt.Errorf("node %s failed to sign data: %w", n.ID, err)
+	}
+	return signature, nil
+}
+
+// VerifySignature verifies a signature against the node's public key.
+// Assumes the input data is the hash that was signed.
+func (n *Node) VerifySignature(dataHash []byte, signature []byte) bool {
+	return ecdsa.VerifyASN1(n.PublicKey, dataHash, signature) // Use dataHash directly
+}
+
+// PublicKeyHex returns the public key as a hex string.
+func (n *Node) PublicKeyHex() string {
+	return hex.EncodeToString(elliptic.Marshal(n.PublicKey.Curve, n.PublicKey.X, n.PublicKey.Y))
+}
+
+// Authenticate marks the node as authenticated (simplified).
 func (n *Node) Authenticate() {
-	n.IsAuthenticated.Store(true)
-	log.Printf("Node %s authenticated.", n.ID)
+	n.Authentication.IsAuthenticated.Store(true)
+	n.LastAttested = time.Now() // Update attestation time
+	n.TrustScore = 0.75         // Increase trust on basic auth
+	fmt.Printf("[Auth] Node %s basic authentication successful.\n", n.ID)
 }
 
-// Validator represents a node that participates in consensus (dBFT).
+// IsAuthenticated checks if the node is currently authenticated.
+func (n *Node) IsAuthenticated() bool {
+	return n.Authentication.IsAuthenticated.Load()
+}
+
+// GetAuthNonce gets the current authentication nonce.
+func (n *Node) GetAuthNonce() uint64 {
+	return n.Authentication.AuthNonce.Load()
+}
+
+// IncrementAuthNonce increments the authentication nonce atomically.
+func (n *Node) IncrementAuthNonce() uint64 {
+	return n.Authentication.AuthNonce.Add(1)
+}
+
+// UpdateTrustScore adjusts the node's trust score based on behavior.
+func (n *Node) UpdateTrustScore(change float64) {
+	n.TrustScore += change
+	// Clamp score between 0 and 1
+	if n.TrustScore > 1.0 {
+		n.TrustScore = 1.0
+	} else if n.TrustScore < 0.0 {
+		n.TrustScore = 0.0
+	}
+	fmt.Printf("[Auth] Node %s trust score updated to %.2f\n", n.ID, n.TrustScore)
+}
+
+// --- Validator --- //
+
+// Validator extends Node with reputation and active status for consensus.
 type Validator struct {
 	Node       *Node
-	Reputation atomic.Int64 // Reputation score
-	IsActive   atomic.Bool  // Whether the validator is currently active
-	mu         sync.RWMutex // Protects validator-specific state if needed later
+	Reputation atomic.Int64 // Use atomic.Int64
+	IsActive   atomic.Bool  // Use atomic.Bool
 }
 
-// NewValidator creates a validator from a node.
+// NewValidator creates a new Validator instance.
 func NewValidator(node *Node, initialReputation int64) *Validator {
 	v := &Validator{
 		Node: node,
@@ -60,15 +120,4 @@ func NewValidator(node *Node, initialReputation int64) *Validator {
 	v.Reputation.Store(initialReputation)
 	v.IsActive.Store(true) // Assume active initially
 	return v
-}
-
-// UpdateReputation changes the validator's reputation score.
-func (v *Validator) UpdateReputation(change int64) {
-	current := v.Reputation.Add(change)
-	log.Printf("Validator %s reputation updated by %d to %d", v.Node.ID, change, current)
-	// Add logic here to deactivate if reputation drops too low
-	// if current < -10 { // Example threshold
-	//  v.IsActive.Store(false)
-	//  log.Printf("Validator %s deactivated due to low reputation (%d)", v.Node.ID, current)
-	// }
 }
