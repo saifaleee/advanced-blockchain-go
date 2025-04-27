@@ -197,15 +197,44 @@ func (bc *Blockchain) MineShardBlock(shardID uint64, proposerID NodeID) (*Block,
 		bc.BlockChains[shardID] = make([]*Block, 0)
 		log.Printf("[Blockchain] Initialized chain storage for new shard %d.", shardID)
 	}
-	// Basic validation: check if parent exists (unless genesis)
-	if finalizedBlock.Header.Height > 0 {
+	// Basic validation: check parent linkage
+	if finalizedBlock.Header.Height > 0 { // Only check parent linkage if not the true genesis (Height 0, which isn't mined this way)
 		currentChain := bc.BlockChains[shardID]
-		if len(currentChain) == 0 || !bytes.Equal(currentChain[len(currentChain)-1].Hash, finalizedBlock.Header.PrevBlockHash) {
+		isFirstBlock := finalizedBlock.Header.Height == 1 // Check if it's the first block after genesis concept
+
+		parentMismatch := false
+		// If it's the first block (H:1), PrevBlockHash MUST be nil/empty.
+		// If it's NOT the first block (H>1), PrevBlockHash MUST match the chain head.
+		if isFirstBlock {
+			if len(finalizedBlock.Header.PrevBlockHash) != 0 {
+				parentMismatch = true
+				log.Printf("[Blockchain] CRITICAL: Shard %d: First block H:1 has non-nil PrevBlockHash (%x). Discarding.",
+					shardID, safeSlice(finalizedBlock.Header.PrevBlockHash, 4))
+			}
+			// Also ensure the chain map is actually empty before adding H:1
+			if len(currentChain) != 0 {
+				parentMismatch = true
+				log.Printf("[Blockchain] CRITICAL: Shard %d: Attempting to add first block H:1 but chain map is not empty (len:%d). Discarding.",
+					shardID, len(currentChain))
+			}
+		} else { // Block height > 1
+			if len(currentChain) == 0 || !bytes.Equal(currentChain[len(currentChain)-1].Hash, finalizedBlock.Header.PrevBlockHash) {
+				parentMismatch = true
+				// Use the existing detailed logging for mismatch
+				if len(currentChain) == 0 {
+					log.Printf("[Blockchain] CRITICAL: Shard %d: Proposed block H:%d (Prev: %x) has no parent in empty chain map (expected H:%d). Discarding.",
+						shardID, finalizedBlock.Header.Height, safeSlice(finalizedBlock.Header.PrevBlockHash, 4), finalizedBlock.Header.Height-1)
+				} else {
+					log.Printf("[Blockchain] CRITICAL: Shard %d: Proposed block H:%d (Prev: %x) does not link to current chain head (H:%d, Hash:%x). Discarding.",
+						shardID, finalizedBlock.Header.Height, safeSlice(finalizedBlock.Header.PrevBlockHash, 4),
+						currentChain[len(currentChain)-1].Header.Height, safeSlice(currentChain[len(currentChain)-1].Hash, 4))
+				}
+			}
+		}
+
+		if parentMismatch {
 			bc.ChainMu.Unlock()
-			log.Printf("[Blockchain] CRITICAL: Shard %d: Proposed block H:%d (Prev: %x) does not link to current chain head (H:%d, Hash:%x). Discarding.",
-				shardID, finalizedBlock.Header.Height, safeSlice(finalizedBlock.Header.PrevBlockHash, 4),
-				currentChain[len(currentChain)-1].Header.Height, safeSlice(currentChain[len(currentChain)-1].Hash, 4))
-			return nil, fmt.Errorf("proposed block for shard %d does not link to chain head", shardID)
+			return nil, fmt.Errorf("proposed block for shard %d does not link correctly to the chain", shardID)
 		}
 	}
 	bc.BlockChains[shardID] = append(bc.BlockChains[shardID], finalizedBlock)
