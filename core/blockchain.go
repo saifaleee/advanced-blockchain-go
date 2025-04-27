@@ -129,114 +129,182 @@ func (bc *Blockchain) AddTransaction(tx *Transaction) error {
 }
 
 // MineShardBlock coordinates the process of proposing and finalizing a block for a specific shard.
-func (bc *Blockchain) MineShardBlock(shardID uint64, proposerID NodeID) (*Block, error) {
+// Includes selecting a proposer (potentially via VRF) and handling cross-shard TX states.
+func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) { // Removed proposerID argument
 	shard, ok := bc.ShardManager.GetShard(shardID)
-	if !ok { // Changed from checking err != nil to checking !ok
+	if !ok {
 		return nil, fmt.Errorf("could not get shard %d for mining", shardID)
 	}
 
-	// 1. Get Transactions and Previous Block Info
-	transactions := shard.GetTransactionsForBlock(10) // Assuming max 10 TXs per block
-
-	// Get previous block hash and height from the blockchain's map
+	// 1. Get Previous Block Info & Determine Next Height
 	bc.ChainMu.RLock()
 	chain, chainExists := bc.BlockChains[shardID]
 	var prevBlockHash []byte
-	var prevBlockHeight uint64 = 0                  // Genesis block is height 0
-	var prevBlockVC VectorClock = make(VectorClock) // Start with empty VC for genesis
+	var prevBlockHeight uint64 = 0
+	var prevBlockVC VectorClock = make(VectorClock)
 	if chainExists && len(chain) > 0 {
 		lastBlock := chain[len(chain)-1]
 		prevBlockHash = lastBlock.Hash
 		prevBlockHeight = lastBlock.Header.Height
-		prevBlockVC = lastBlock.Header.VectorClock // Get VC from previous block header
+		prevBlockVC = lastBlock.Header.VectorClock
 	} else {
-		// This is the first block (genesis) for this shard
-		log.Printf("[Blockchain] Shard %d: No previous block found, proposing genesis block (Height 0).", shardID)
-		// Genesis block doesn't need PoW in the same way, handle separately?
-		// For now, let ProposeBlock handle height 0.
+		log.Printf("[Blockchain] Shard %d: No previous block found, preparing for first block (Height 1).", shardID)
+		// Height 0 is conceptual genesis, first mined block is Height 1
 	}
 	bc.ChainMu.RUnlock()
+	nextBlockHeight := prevBlockHeight + 1
 
-	// Apply state changes *before* calculating the final state root for the block
+	// 1.5 Select Proposer (Ticket 7 - VRF Integration Point)
+	// Use VRF to select a proposer for this specific block height
+	seed := prevBlockHash // Use prev block hash as part of the VRF seed
+	vrf, err := NewSecureVRF()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize VRF: %w", err)
+	}
+
+	vrfInput := append(seed, byte(shardID), byte(nextBlockHeight))
+	vrfOutput, err := vrf.Evaluate(vrfInput)
+	if err != nil {
+		return nil, fmt.Errorf("failed to evaluate VRF: %w", err)
+	}
+
+	proposerValidator, err := bc.ValidatorManager.SelectDelegateWithVRF(vrfOutput.Output, shardID, nextBlockHeight)
+	if err != nil {
+		return nil, fmt.Errorf("failed to select proposer with VRF: %w", err)
+	}
+
+	proposerID := proposerValidator.Node.ID
+	log.Printf("[Blockchain] Shard %d: Selected proposer %s for H:%d.", shardID, proposerID, nextBlockHeight)
+
+	// 2. Get Transactions & Prepare for State Changes
+	transactions := shard.GetTransactionsForBlock(10) // Assuming max 10 TXs per block
+
+	// --- 2PC Prepare Phase ---
+	preparedTxIDs := make(map[string]bool) // Track prepared TXs
+	for _, tx := range transactions {
+		if tx.Type == CrossShardInitiateTx {
+			log.Printf("[2PC] Shard %d: Preparing CrossShardInitiateTx %x...", shardID, safeSlice(tx.ID, 4))
+			tx.Status = "Prepared" // Mark as prepared
+			preparedTxIDs[string(tx.ID)] = true
+		} else if tx.Type == CrossShardFinalizeTx {
+			log.Printf("[2PC] Shard %d: Checking status for CrossShardFinalizeTx %x...", shardID, safeSlice(tx.ID, 4))
+			// Assume the corresponding Initiate TX is committed for now
+		}
+	}
+
+	// 3. Apply State Changes
 	finalStateRoot, err := shard.ApplyStateChanges(transactions)
 	if err != nil {
-		// If state application fails, we probably shouldn't mine the block
-		log.Printf("[Blockchain] Shard %d: Failed to apply state changes for new block: %v. Aborting mining.", shardID, err)
-		return nil, fmt.Errorf("failed to apply state changes for shard %d: %w", shardID, err)
+		log.Printf("[Blockchain] Shard %d: Failed to apply state changes for H:%d: %v. Aborting mining.", shardID, nextBlockHeight, err)
+		// --- 2PC Integration Point (Ticket 3) ---
+		// If state application fails *after* preparing, need to trigger 'Abort' for prepared TXs.
+		for txIDStr := range preparedTxIDs {
+			log.Printf("[2PC Placeholder] Shard %d: Aborting prepared CrossShardInitiateTx %x due to state apply failure.", shardID, safeSlice([]byte(txIDStr), 4))
+			// TODO: Implement 2PC Abort Logic (unlock resources, mark TX as Aborted)
+		}
+		// --- End 2PC Abort Phase ---
+		return nil, fmt.Errorf("failed to apply state changes for shard %d H:%d: %w", shardID, nextBlockHeight, err)
 	}
 
-	// 2. Propose Block (Create Header, Run PoW)
-	// Use the core ProposeBlock function which handles header creation, Merkle root, Bloom filter, VC, accumulator, and PoW.
-	// Pass the state root calculated *after* applying transactions.
-	newBlock, err := ProposeBlock(shardID, transactions, prevBlockHash, prevBlockHeight+1, finalStateRoot, bc.Config.PoWDifficulty, proposerID, prevBlockVC)
+	// 4. Propose Block (Create Header, Run PoW)
+	newBlock, err := ProposeBlock(shardID, transactions, prevBlockHash, nextBlockHeight, finalStateRoot, bc.Config.PoWDifficulty, proposerID, prevBlockVC)
 	if err != nil {
-		return nil, fmt.Errorf("failed to propose block for shard %d: %w", shardID, err)
+		// Handle potential proposal failure (e.g., error during Merkle tree creation)
+		log.Printf("[Blockchain] Shard %d: Failed to propose block H:%d: %v", shardID, nextBlockHeight, err)
+		// --- 2PC Integration Point (Ticket 3) ---
+		// If block proposal fails *after* preparing, need to trigger 'Abort'.
+		for txIDStr := range preparedTxIDs {
+			log.Printf("[2PC Placeholder] Shard %d: Aborting prepared CrossShardInitiateTx %x due to block proposal failure.", shardID, safeSlice([]byte(txIDStr), 4))
+			// TODO: Implement 2PC Abort Logic
+		}
+		// --- End 2PC Abort Phase ---
+		return nil, fmt.Errorf("failed to propose block for shard %d H:%d: %w", shardID, nextBlockHeight, err)
 	}
-	// ProposeBlock already runs PoW and sets Nonce and Hash.
 
-	log.Printf("[Blockchain] Shard %d: Block proposed by %s. Hash: %x, Nonce: %d, Height: %d, StateRoot: %x",
-		shardID, proposerID, safeSlice(newBlock.Hash, 4), newBlock.Header.Nonce, newBlock.Header.Height, safeSlice(newBlock.Header.StateRoot, 4))
+	log.Printf("[Blockchain] Shard %d: Block H:%d proposed by %s. Hash: %x, Nonce: %d, StateRoot: %x",
+		shardID, newBlock.Header.Height, proposerID, safeSlice(newBlock.Hash, 4), newBlock.Header.Nonce, safeSlice(newBlock.Header.StateRoot, 4))
 
-	// 3. Finalize Block (dBFT)
-	// Ensure err is declared correctly here
-	var signedBlock *SignedBlock
-	signedBlock, err = bc.ValidatorManager.FinalizeBlockDBFT(newBlock, shardID) // Correct assignment
+	// 5. Finalize Block (dBFT)
+	signedBlock, err := bc.ValidatorManager.FinalizeBlockDBFT(newBlock, shardID)
 	if err != nil {
 		log.Printf("[Blockchain] Shard %d: Block H:%d Hash:%x proposed by %s FAILED dBFT: %v",
 			shardID, newBlock.Header.Height, safeSlice(newBlock.Hash, 4), proposerID, err)
-		bc.ValidatorManager.UpdateReputation(proposerID, DbftConsensusPenalty) // Use constant
-		return nil, fmt.Errorf("block finalization failed for shard %d: %w", shardID, err)
+		bc.ValidatorManager.UpdateReputation(proposerID, DbftConsensusPenalty)
+		// --- 2PC Integration Point (Ticket 3) ---
+		// If dBFT fails, the block is rejected. Trigger 'Abort' for prepared TXs.
+		for txIDStr := range preparedTxIDs {
+			log.Printf("[2PC Placeholder] Shard %d: Aborting prepared CrossShardInitiateTx %x due to dBFT failure.", shardID, safeSlice([]byte(txIDStr), 4))
+			// TODO: Implement 2PC Abort Logic
+		}
+		// --- End 2PC Abort Phase ---
+		return nil, fmt.Errorf("block finalization failed for shard %d H:%d: %w", shardID, newBlock.Header.Height, err)
 	}
 
-	// Ensure the block returned by dBFT is the one we use
-	finalizedBlock := signedBlock.Block // This block now contains FinalitySignatures in its header
+	finalizedBlock := signedBlock.Block
 
-	// 4. Add Finalized Block to Shard Chain (in Blockchain map) & Update Metrics
+	// --- 2PC Commit Phase ---
+	for _, tx := range finalizedBlock.Transactions {
+		if tx.Type == CrossShardInitiateTx && tx.Status == "Prepared" {
+			log.Printf("[2PC] Shard %d: Committing CrossShardInitiateTx %x...", shardID, safeSlice(tx.ID, 4))
+			tx.Status = "Committed" // Mark as committed
+			// Generate commit proof (e.g., Merkle proof)
+			proof, _, err := finalizedBlock.GetTransactionMerkleProof(tx.ID)
+			if err == nil {
+				serializedProof := bytes.Join(proof, []byte{}) // Serialize [][]byte into []byte
+				tx.CommitProof = serializedProof
+			}
+		} else if tx.Type == CrossShardFinalizeTx {
+			log.Printf("[2PC] Shard %d: Finalized block includes CrossShardFinalizeTx %x.", shardID, safeSlice(tx.ID, 4))
+			tx.Status = "Finalized"
+		}
+	}
+
+	// 6. Add Finalized Block to Shard Chain & Update Metrics
 	bc.ChainMu.Lock()
 	if _, exists := bc.BlockChains[shardID]; !exists {
 		bc.BlockChains[shardID] = make([]*Block, 0)
 		log.Printf("[Blockchain] Initialized chain storage for new shard %d.", shardID)
 	}
 	// Basic validation: check parent linkage
-	if finalizedBlock.Header.Height > 0 { // Only check parent linkage if not the true genesis (Height 0, which isn't mined this way)
-		currentChain := bc.BlockChains[shardID]
-		isFirstBlock := finalizedBlock.Header.Height == 1 // Check if it's the first block after genesis concept
+	currentChain := bc.BlockChains[shardID] // Get chain again after acquiring lock
+	isFirstBlock := finalizedBlock.Header.Height == 1
 
-		parentMismatch := false
-		// If it's the first block (H:1), PrevBlockHash MUST be nil/empty.
-		// If it's NOT the first block (H>1), PrevBlockHash MUST match the chain head.
-		if isFirstBlock {
-			if len(finalizedBlock.Header.PrevBlockHash) != 0 {
-				parentMismatch = true
-				log.Printf("[Blockchain] CRITICAL: Shard %d: First block H:1 has non-nil PrevBlockHash (%x). Discarding.",
-					shardID, safeSlice(finalizedBlock.Header.PrevBlockHash, 4))
-			}
-			// Also ensure the chain map is actually empty before adding H:1
-			if len(currentChain) != 0 {
-				parentMismatch = true
-				log.Printf("[Blockchain] CRITICAL: Shard %d: Attempting to add first block H:1 but chain map is not empty (len:%d). Discarding.",
-					shardID, len(currentChain))
-			}
-		} else { // Block height > 1
-			if len(currentChain) == 0 || !bytes.Equal(currentChain[len(currentChain)-1].Hash, finalizedBlock.Header.PrevBlockHash) {
-				parentMismatch = true
-				// Use the existing detailed logging for mismatch
-				if len(currentChain) == 0 {
-					log.Printf("[Blockchain] CRITICAL: Shard %d: Proposed block H:%d (Prev: %x) has no parent in empty chain map (expected H:%d). Discarding.",
-						shardID, finalizedBlock.Header.Height, safeSlice(finalizedBlock.Header.PrevBlockHash, 4), finalizedBlock.Header.Height-1)
-				} else {
-					log.Printf("[Blockchain] CRITICAL: Shard %d: Proposed block H:%d (Prev: %x) does not link to current chain head (H:%d, Hash:%x). Discarding.",
-						shardID, finalizedBlock.Header.Height, safeSlice(finalizedBlock.Header.PrevBlockHash, 4),
-						currentChain[len(currentChain)-1].Header.Height, safeSlice(currentChain[len(currentChain)-1].Hash, 4))
-				}
-			}
+	parentMismatch := false
+	if isFirstBlock {
+		if len(finalizedBlock.Header.PrevBlockHash) != 0 {
+			parentMismatch = true
+			log.Printf("[Blockchain] CRITICAL: Shard %d: First block H:1 has non-nil PrevBlockHash (%x). Discarding.",
+				shardID, safeSlice(finalizedBlock.Header.PrevBlockHash, 4))
 		}
-
-		if parentMismatch {
-			bc.ChainMu.Unlock()
-			return nil, fmt.Errorf("proposed block for shard %d does not link correctly to the chain", shardID)
+		if len(currentChain) != 0 {
+			parentMismatch = true
+			log.Printf("[Blockchain] CRITICAL: Shard %d: Attempting to add first block H:1 but chain map is not empty (len:%d). Discarding.",
+				shardID, len(currentChain))
+		}
+	} else { // Block height > 1
+		if len(currentChain) == 0 {
+			parentMismatch = true
+			log.Printf("[Blockchain] CRITICAL: Shard %d: Proposed block H:%d (Prev: %x) has no parent in empty chain map (expected H:%d). Discarding.",
+				shardID, finalizedBlock.Header.Height, safeSlice(finalizedBlock.Header.PrevBlockHash, 4), finalizedBlock.Header.Height-1)
+		} else if !bytes.Equal(currentChain[len(currentChain)-1].Hash, finalizedBlock.Header.PrevBlockHash) {
+			parentMismatch = true
+			log.Printf("[Blockchain] CRITICAL: Shard %d: Proposed block H:%d (Prev: %x) does not link to current chain head (H:%d, Hash:%x). Discarding.",
+				shardID, finalizedBlock.Header.Height, safeSlice(finalizedBlock.Header.PrevBlockHash, 4),
+				currentChain[len(currentChain)-1].Header.Height, safeSlice(currentChain[len(currentChain)-1].Hash, 4))
 		}
 	}
+
+	if parentMismatch {
+		bc.ChainMu.Unlock()
+		// --- 2PC Integration Point (Ticket 3) ---
+		// If block is discarded due to linkage error *after* commit phase logic,
+		// this is a critical state inconsistency. May need manual intervention or complex rollback.
+		// For now, just log the error.
+		log.Printf("[2PC CRITICAL] Shard %d: Block H:%d discarded due to linkage error after 2PC commit logic executed!", shardID, finalizedBlock.Header.Height)
+		// --- End 2PC Critical Note ---
+		return nil, fmt.Errorf("proposed block H:%d for shard %d does not link correctly to the chain", finalizedBlock.Header.Height, shardID)
+	}
+
 	bc.BlockChains[shardID] = append(bc.BlockChains[shardID], finalizedBlock)
 	chainLen := len(bc.BlockChains[shardID])
 	bc.ChainMu.Unlock()
@@ -248,10 +316,10 @@ func (bc *Blockchain) MineShardBlock(shardID uint64, proposerID NodeID) (*Block,
 		shardID, finalizedBlock.Header.Height, safeSlice(finalizedBlock.Hash, 4), chainLen)
 
 	// Reward proposer for successful block
-	bc.ValidatorManager.UpdateReputation(proposerID, DbftConsensusReward) // Use constant
+	bc.ValidatorManager.UpdateReputation(proposerID, DbftConsensusReward)
 
-	// 5. Prune old state/blocks if necessary
-	bc.PruneChain(shardID, bc.Config.PruneKeepBlocks) // Use configured value
+	// 7. Prune old state/blocks if necessary
+	bc.PruneChain(shardID, bc.Config.PruneKeepBlocks)
 
 	// Update overall chain height (simple max height tracking)
 	bc.mu.Lock()
@@ -332,6 +400,16 @@ func (bc *Blockchain) PruneChain(shardID uint64, minBlocksToKeep int) {
 	}
 
 	prunedCount := currentLen - minBlocksToKeep
+
+	// Add state archival logic during pruning
+	archivedStates := make(map[uint64][]byte) // Map of block height to state root
+	for i := 0; i < prunedCount; i++ {
+		block := chain[i]
+		archivedStates[block.Header.Height] = block.Header.StateRoot
+		log.Printf("[Archive] Archived state for Block H:%d with StateRoot: %x", block.Header.Height, safeSlice(block.Header.StateRoot, 4))
+	}
+	// TODO: Persist archivedStates to external storage (e.g., database, file system)
+
 	bc.BlockChains[shardID] = chain[prunedCount:] // Keep the last 'minBlocksToKeep' blocks
 
 	newLen := len(bc.BlockChains[shardID])

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
@@ -109,6 +110,15 @@ func (vm *ValidatorManager) UpdateReputation(id NodeID, change int64) {
 		}
 		v.Reputation.Store(newRep)
 		vm.ReputationScores[id] = newRep // Update score in the map
+
+		// Add slashing conditions for adversarial behavior
+		if change < 0 {
+			log.Printf("[Slashing] Validator %s penalized by %d points.", id, -change)
+			if newRep < 10 { // Threshold for slashing
+				log.Printf("[Slashing] Validator %s reputation critically low (%d). Marking as inactive.", id, newRep)
+				v.IsActive.Store(false)
+			}
+		}
 	} else {
 		log.Printf("Attempted to update reputation for non-existent validator %s", id)
 	}
@@ -221,6 +231,11 @@ func (vm *ValidatorManager) FinalizeBlockDBFT(block *Block, shardID uint64) (*Si
 					voteMu.Unlock()
 				} else {
 					log.Printf("[Consensus] Shard %d: Validator %s produced INVALID signature for block %x!", shardID, v.Node.ID, safeSlice(block.Hash, 4))
+					// Add Penalty for invalid signature (Ticket 6)
+					voteMu.Lock()
+					vm.UpdateReputation(v.Node.ID, -5) // Penalize for invalid signature
+					v.Node.UpdateTrustScore(-0.1)      // Decrease trust score
+					voteMu.Unlock()
 				}
 			} else {
 				log.Printf("[Consensus] Shard %d: Validator %s (simulated) voted NO for Block %x", shardID, v.Node.ID, safeSlice(block.Hash, 4))
@@ -309,7 +324,8 @@ func (vm *ValidatorManager) calculateAdaptiveThreshold(eligibleValidators []*Val
 }
 
 // SelectDelegateWithVRF selects a delegate using a Verifiable Random Function (placeholder).
-func (vm *ValidatorManager) SelectDelegateWithVRF(seed []byte, shardID uint64) (*Validator, error) {
+// Uses a combination of a seed (e.g., prev block hash) and shard ID for input.
+func (vm *ValidatorManager) SelectDelegateWithVRF(seed []byte, shardID uint64, blockHeight uint64) (*Validator, error) { // Added blockHeight
 	vm.mu.RLock()
 	defer vm.mu.RUnlock()
 
@@ -321,13 +337,26 @@ func (vm *ValidatorManager) SelectDelegateWithVRF(seed []byte, shardID uint64) (
 	var bestValidator *Validator
 	var lowestValue *big.Int
 
-	log.Printf("[Consensus] Simulating VRF Delegate Selection for Shard %d with %d candidates.", shardID, len(eligible))
+	log.Printf("[Consensus] Simulating VRF Delegate Selection for Shard %d (H:%d) with %d candidates.", shardID, blockHeight, len(eligible))
+
+	// Create a more deterministic base input for this selection round
+	baseInput := bytes.Join(
+		[][]byte{
+			seed, // e.g., previous block hash
+			[]byte(fmt.Sprintf("%d", shardID)),
+			[]byte(fmt.Sprintf("%d", blockHeight)), // Include height
+		},
+		[]byte{},
+	)
 
 	for _, v := range eligible {
-		input := append(seed, []byte(v.Node.ID)...)
-		hash := sha256.Sum256(input)
+		// Combine base input with validator-specific info
+		vrfInput := append(append([]byte{}, baseInput...), []byte(v.Node.ID)...)
+		hash := sha256.Sum256(vrfInput)
 		value := new(big.Int).SetBytes(hash[:])
 
+		// In a real VRF, we'd verify the proof here.
+		// We assume the simulated generation is always valid for the placeholder.
 		isValidProof := true
 
 		if isValidProof {
@@ -339,11 +368,12 @@ func (vm *ValidatorManager) SelectDelegateWithVRF(seed []byte, shardID uint64) (
 	}
 
 	if bestValidator == nil {
-		log.Printf("[Consensus] VRF selection failed for shard %d, falling back to random.", shardID)
+		// This should ideally not happen if there are eligible validators, but handle defensively.
+		log.Printf("[Consensus] VRF selection failed unexpectedly for shard %d (H:%d), falling back to random.", shardID, blockHeight)
 		return eligible[vm.randSource.Intn(len(eligible))], nil
 	}
 
-	log.Printf("[Consensus] VRF selected Validator %s for Shard %d (Value: %s...)", bestValidator.Node.ID, shardID, lowestValue.String()[:10])
+	log.Printf("[Consensus] VRF selected Validator %s for Shard %d (H:%d) (Value: %s...)", bestValidator.Node.ID, shardID, blockHeight, lowestValue.String()[:10])
 	return bestValidator, nil
 }
 

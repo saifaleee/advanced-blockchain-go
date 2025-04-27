@@ -193,7 +193,7 @@ func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []b
 	}
 	merkleTree, err := NewMerkleTree(txHashes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create merkle tree: %w", err)
+		return nil, fmt.Errorf("failed to create Merkle tree: %w", err)
 	}
 	block.Header.MerkleRoot = merkleTree.GetMerkleRoot()
 
@@ -291,7 +291,11 @@ func NewGenesisBlock(shardID uint64, coinbase *Transaction, difficulty int, gene
 			Hash:         []byte("genesis_fallback_hash"),
 		}
 		if len(block.Transactions) > 0 {
-			tree, _ := NewMerkleTree([][]byte{block.Transactions[0].ID}) // Replace `Hash()` with `ID`
+			tree, err := NewMerkleTree([][]byte{block.Transactions[0].ID}) // Replace `Hash()` with `ID`
+			if err != nil {
+				log.Printf("Warning: Failed to create Merkle tree for single transaction: %v", err)
+				return nil
+			}
 			if tree != nil {
 				block.Header.MerkleRoot = tree.GetMerkleRoot()
 			}
@@ -355,58 +359,36 @@ func (b *Block) GetTransactionMerkleProof(txID []byte) ([][]byte, uint64, error)
 	return proofHashes, uint64(txIndex), nil
 }
 
-// UpdateAccumulator updates the block's accumulator state with new data (placeholder - simple hash chain).
-// H_new = SHA256(H_old || SHA256(data1) || SHA256(data2) || ...)
-func (bh *BlockHeader) UpdateAccumulator(newData [][]byte) error {
-	hasher := sha256.New()
-	hasher.Write(bh.AccumulatorState) // Start with the current state
+// Enhanced cryptographic accumulator implementation using Merkle trees
 
-	for _, item := range newData {
-		itemHash := sha256.Sum256(item)
-		hasher.Write(itemHash[:]) // Append hash of new item
+// UpdateAccumulator updates the block's accumulator state using a Merkle tree.
+func (bh *BlockHeader) UpdateAccumulator(newData [][]byte) error {
+	if len(newData) == 0 {
+		return fmt.Errorf("no data provided for accumulator update")
 	}
 
-	bh.AccumulatorState = hasher.Sum(nil)
-	// log.Printf("[BlockHeader H:%d] Updated accumulator state to %x", bh.Height, safeSlice(bh.AccumulatorState, 8)) // Reduce log noise
+	// Build a Merkle tree from the new data
+	merkleTree, err := NewMerkleTree(newData)
+	if err != nil {
+		// Handle the error appropriately, e.g., return it or log it
+		return fmt.Errorf("failed to update accumulator: %w", err)
+	}
+	bh.AccumulatorState = merkleTree.GetMerkleRoot() // Use GetMerkleRoot() instead of RootHash()
 	return nil
 }
 
-// GenerateProof generates an advanced proof (placeholder - simple accumulator proof).
-// For a simple hash chain H(H_old || H(d1) || H(d2)), proof for d1 could be [H_old, H(d2)].
-func (bh *BlockHeader) GenerateProof(dataID []byte) ([]byte, error) {
-	log.Printf("[BlockHeader H:%d] Generating accumulator proof for data %x (placeholder)", bh.Height, safeSlice(dataID, 4))
-	// This requires knowing the order/content of items added. Complex for this PoC.
-	// Return a placeholder indicating the data ID and the final accumulator state.
-	proof := bytes.Join([][]byte{
-		[]byte("simple_accumulator_proof_for:"),
-		dataID,
-		[]byte("final_state:"),
-		bh.AccumulatorState,
-	}, []byte(" "))
+// GenerateProof generates a Merkle proof for a specific data item.
+func (bh *BlockHeader) GenerateProof(data []byte) ([]byte, error) {
+	merkleTree := NewMerkleTreeFromRoot(bh.AccumulatorState)
+	proof, err := merkleTree.GenerateProof(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate proof: %w", err)
+	}
 	return proof, nil
 }
 
-// VerifyProof verifies an advanced proof (placeholder - simple accumulator).
-// This would require recomputing the accumulator state with the proof elements.
-func VerifyProof(blockHeader *BlockHeader, proof []byte, dataID []byte) bool {
-	if blockHeader == nil {
-		log.Printf("[VerifyProof] Error: Block header is nil")
-		return false
-	}
-	log.Printf("[VerifyProof H:%d] Verifying accumulator proof for data %x (placeholder)", blockHeader.Height, safeSlice(dataID, 4))
-	// Placeholder: Check if the proof contains the expected final state.
-	// A real verification would involve cryptographic checks.
-	parts := bytes.Split(proof, []byte(" "))
-	if len(parts) == 4 && bytes.Equal(parts[0], []byte("simple_accumulator_proof_for:")) && bytes.Equal(parts[2], []byte("final_state:")) {
-		// Check if the dataID matches (optional, depends on proof format)
-		// Check if the final state in the proof matches the header's state
-		if bytes.Equal(parts[3], blockHeader.AccumulatorState) {
-			// log.Printf("[VerifyProof H:%d] Placeholder verification successful for %x", blockHeader.Height, safeSlice(dataID, 4)) // Reduce log noise
-			return true
-		}
-		log.Printf("[VerifyProof H:%d] Failed: Accumulator state mismatch. Expected %x, Got %x", blockHeader.Height, safeSlice(blockHeader.AccumulatorState, 8), safeSlice(parts[3], 8))
-		return false
-	}
-	log.Printf("[VerifyProof H:%d] Failed: Invalid proof format.", blockHeader.Height)
-	return false // Placeholder failure
+// VerifyProof verifies a Merkle proof for a specific data item.
+func (bh *BlockHeader) VerifyProof(data []byte, proof []byte) bool {
+	merkleTree := NewMerkleTreeFromRoot(bh.AccumulatorState)
+	return merkleTree.VerifyProof(data, proof)
 }

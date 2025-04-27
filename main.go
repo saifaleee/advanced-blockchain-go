@@ -211,7 +211,8 @@ func main() {
 							return
 						}
 
-						finalizedBlock, mineErr := bc.MineShardBlock(sID, localNode.ID)
+						// Call MineShardBlock with only the shard ID
+						finalizedBlock, mineErr := bc.MineShardBlock(sID)
 
 						if mineErr != nil {
 							if mineErr.Error() == "no transactions to mine" {

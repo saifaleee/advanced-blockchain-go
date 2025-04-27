@@ -2,84 +2,76 @@ package core
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
-	"sort" // Added for sorting NodeIDs
+	"math/big"
+	"sort"
 )
 
 // VRFOutput represents the output and proof of a VRF evaluation.
 type VRFOutput struct {
-	Input []byte
-	Value uint64 // Pseudo-random value derived from input
-	Proof []byte // Placeholder for cryptographic proof (e.g., the hash itself)
+	Output []byte
+	Proof  []byte
 }
 
-// SimpleVRF is a placeholder implementation. NOT SECURE.
-type SimpleVRF struct {
-	// In a real VRF, this would hold the secret key.
-	// We simulate its effect without storing it explicitly here.
-	seed []byte // Only used for generation simulation
+// SecureVRF implements a secure VRF using ECDSA keys.
+type SecureVRF struct {
+	privateKey *ecdsa.PrivateKey
+	publicKey  *ecdsa.PublicKey
 }
 
-func NewSimpleVRF(seed []byte) *SimpleVRF {
-	// Seed is used only conceptually for generation simulation
-	// Store a copy of the seed to prevent external modification
-	seedCopy := make([]byte, len(seed))
-	copy(seedCopy, seed)
-	return &SimpleVRF{seed: seedCopy}
-}
-
-// Evaluate simulates computing the VRF output using a secret key (represented by seed).
-func (v *SimpleVRF) Evaluate(input []byte) (*VRFOutput, error) {
-	if v.seed == nil {
-		// This check might be removed if seed is only conceptual,
-		// but useful for ensuring the generator is initialized.
-		return nil, fmt.Errorf("VRF seed not initialized for evaluation simulation")
+// NewSecureVRF generates a new SecureVRF instance with a fresh ECDSA key pair.
+func NewSecureVRF() (*SecureVRF, error) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate ECDSA key pair: %w", err)
 	}
-	// Simulate using a secret (seed) + input to generate hash/proof
-	data := append(append([]byte{}, v.seed...), input...) // Use seed copy
-	hash := sha256.Sum256(data)
-	proof := hash[:] // Proof is the hash in this simulation
-
-	// Derive value from the proof (publicly derivable part)
-	value := binary.BigEndian.Uint64(proof[:8])
-
-	// Return a copy of the input in the output
-	inputCopy := make([]byte, len(input))
-	copy(inputCopy, input)
-
-	return &VRFOutput{
-		Input: inputCopy,
-		Value: value,
-		Proof: proof,
+	return &SecureVRF{
+		privateKey: privateKey,
+		publicKey:  &privateKey.PublicKey,
 	}, nil
 }
 
-// VerifyVRF simulates public verification using only public information (input, output).
-func VerifyVRF(input []byte, output *VRFOutput) bool {
-	if output == nil {
-		// fmt.Println("VRF Verify Fail: Output nil") // Reduce log noise
-		return false
+// Evaluate computes the VRF output and proof for a given input.
+func (v *SecureVRF) Evaluate(input []byte) (*VRFOutput, error) {
+	hash := sha256.Sum256(input)
+	r, s, err := ecdsa.Sign(rand.Reader, v.privateKey, hash[:])
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign input: %w", err)
 	}
-	if !bytes.Equal(input, output.Input) {
-		// fmt.Printf("VRF Verify Fail: Input mismatch (Expected: %x, Got: %x)", input, output.Input) // Reduce log noise
-		return false
-	}
-	// Check if proof has the expected format (SHA256 hash length)
-	if len(output.Proof) != sha256.Size {
-		// fmt.Printf("VRF Verify Fail: Proof length %d != %d", len(output.Proof), sha256.Size) // Reduce log noise
-		return false
-	}
-	// Check if the value can be derived from the proof (as per our placeholder logic)
-	expectedValue := binary.BigEndian.Uint64(output.Proof[:8])
-	if output.Value != expectedValue {
-		// fmt.Printf("VRF Verify Fail: Value mismatch (Output: %d, Expected from Proof: %d)", output.Value, expectedValue) // Reduce log noise
+
+	proof := append(r.Bytes(), s.Bytes()...)
+	return &VRFOutput{
+		Output: hash[:],
+		Proof:  proof,
+	}, nil
+}
+
+// Verify verifies the VRF output and proof using the public key.
+func (v *SecureVRF) Verify(input []byte, output *VRFOutput) bool {
+	hash := sha256.Sum256(input)
+	if !equal(hash[:], output.Output) {
 		return false
 	}
 
-	// In a real VRF, verification would involve cryptographic checks using a public key.
-	// This placeholder check is very basic.
+	r := new(big.Int).SetBytes(output.Proof[:len(output.Proof)/2])
+	s := new(big.Int).SetBytes(output.Proof[len(output.Proof)/2:])
+	return ecdsa.Verify(v.publicKey, hash[:], r, s)
+}
+
+// equal compares two byte slices for equality.
+func equal(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
 	return true
 }
 
