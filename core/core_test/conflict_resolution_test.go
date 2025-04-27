@@ -62,8 +62,9 @@ func TestVectorClock_Compare(t *testing.T) {
 
 	// vc1 happens before vc2
 	vc1.Increment(nodeA) // vc1: {1:1}
-	assert.Equal(t, -1, vc1.Compare(vc2), "vc1 should happen before vc2 (empty)")
-	assert.Equal(t, 1, vc2.Compare(vc1), "vc2 (empty) should happen after vc1")
+	// Corrected Expectations: {1:1} happens AFTER {}
+	assert.Equal(t, 1, vc1.Compare(vc2), "vc1 {1:1} should happen AFTER vc2 {}")
+	assert.Equal(t, -1, vc2.Compare(vc1), "vc2 {} should happen BEFORE vc1 {1:1}")
 
 	vc2.Increment(nodeA) // vc2: {1:1}
 	assert.Equal(t, 0, vc1.Compare(vc2), "Clocks should be equal after same increment")
@@ -517,17 +518,20 @@ func TestHandlePotentialConflict(t *testing.T) {
 		vrfInput := hasher.Sum(nil)
 		vrfOutput, _, _ := vrfInstance.Evaluate(vrfInput)
 		winnerIndex := int(new(big.Int).Mod(new(big.Int).SetBytes(vrfOutput), big.NewInt(2)).Int64())
-		expectedWinner := sortedVersions[winnerIndex]
+		expectedWinner := sortedVersions[winnerIndex] // Use the calculated winner index
+		// The assertion below might need adjustment depending on the mock VRF's deterministic output for the given inputs.
+		// assert.Equal(t, nodeB, expectedWinner.SourceNode, "Sanity check: Expected winner should be nodeB")
 
 		resolved := resolver.HandlePotentialConflict(local, remote, vrfContext)
 
-		// Expected: VRF winner, clock is merged
+		// Expected: VRF winner (remote/nodeB), clock is merged
 		expectedVC := core.VectorClock{uint64(1): 1, uint64(2): 1, uint64(3): 2} // Merge takes max
-		expected := expectedWinner
-		expected.VectorClock = expectedVC // Function should set the merged clock
+		expected := expectedWinner                                               // This is the remote version
+		expected.VectorClock = expectedVC                                        // Function should set the merged clock
 
-		assert.Equal(t, expectedWinner.Value, resolved.Value, "Should return VRF winner value")
+		// Corrected Assertions: Expect remote values
+		assert.Equal(t, expectedWinner.Value, resolved.Value, "Should return VRF winner value") // Expect "valRemote"
 		assert.Equal(t, expectedVC, resolved.VectorClock, "Should return merged vector clock")
-		assert.Equal(t, expected, resolved)
+		assert.Equal(t, expected, resolved) // Expect remote StateVersion with merged clock
 	})
 }

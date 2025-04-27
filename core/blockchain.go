@@ -212,8 +212,8 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) {
 
 		} else if tx.Type == CrossShardTxFinalize {
 			if tx.DestinationShard == nil || *tx.DestinationShard != shardID {
-				// Corrected log format: Removed the extra %v which caused the argument mismatch
-				log.Printf("Error: CrossShardTxFinalize %x found in shard %d, but DestinationShard field is missing or incorrect. Discarding.", tx.ID, shardID)
+				// Simplified log message to try and resolve persistent format error.
+				log.Printf("Error: CrossShardTxFinalize %x in shard %d has incorrect/missing DestinationShard. Discarding.", tx.ID, shardID)
 				continue
 			}
 			log.Printf("Shard %d: Including cross-shard finalize Tx %x", shardID, tx.ID)
@@ -363,8 +363,9 @@ func ValidateBlockIntegrity(newBlock, prevBlock *Block, vm *ValidatorManager) bo
 		return false
 	}
 	if !bytes.Equal(newBlock.Header.PrevBlockHash, prevBlock.Hash) {
-		log.Printf("Validation Error: Shard %d Block %d PrevBlockHash (%x) mismatch Block %d Hash (%x)",
-			newBlock.Header.ShardID, newBlock.Header.Height, newBlock.Header.PrevBlockHash, prevBlock.Header.Height, prevBlock.Hash)
+		// Simplified log message to address persistent format error
+		log.Printf("Validation Error: Shard %d Block %d PrevBlockHash mismatch.",
+			newBlock.Header.ShardID, newBlock.Header.Height)
 		return false
 	}
 	if newBlock.Header.Height != prevBlock.Header.Height+1 {

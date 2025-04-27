@@ -100,55 +100,96 @@ func (vc VectorClock) Merge(other VectorClock) {
 //	 1 if vc > other (vc happened after other)
 //	 2 if concurrent (neither happened strictly after the other, and not identical)
 func (vc VectorClock) Compare(other VectorClock) int {
-	// Handle nil cases: Treat nil as concurrent with non-nil, equal to nil.
+	// Handle nil cases consistently: nil is concurrent with non-nil, equal to nil.
 	if vc == nil && other == nil {
 		return 0 // Equal
 	}
-	if vc == nil || other == nil {
-		return 2 // Concurrent
+	if vc == nil {
+		// Treat nil as the "empty" clock {}. An empty clock is Before any non-empty clock.
+		if len(other) == 0 {
+			return 0 // nil == empty
+		} else {
+			return -1 // nil < non-empty
+		}
+	}
+	if other == nil {
+		if len(vc) == 0 {
+			return 0 // empty == nil
+		} else {
+			return 1 // non-empty > nil
+		}
 	}
 
-	vcGreaterThanOther := false // True if vc[k] > other[k] for at least one k, and vc[k] >= other[k] for all k in other
-	otherGreaterThanVc := false // True if other[k] > vc[k] for at least one k, and other[k] >= vc[k] for all k in vc
+	vcLessEqOther := true // Assume vc <= other
+	otherLessEqVc := true // Assume other <= vc
 
-	// Check if vc dominates other (vc >= other for all keys in other)
-	vcDominates := true
-	for kOther, vOther := range other {
-		vVc, ok := vc[kOther]
-		if !ok || vVc < vOther {
-			vcDominates = false // vc does not dominate
+	// Check vc <= other
+	for k, vVc := range vc {
+		vOther, ok := other[k]
+		if !ok || vVc > vOther { // If k exists in vc but not other, OR vc[k] > other[k]
+			vcLessEqOther = false
 			break
 		}
-		if vVc > vOther {
-			vcGreaterThanOther = true // Found at least one element where vc is strictly greater
-		}
 	}
 
-	// Check if other dominates vc (other >= vc for all keys in vc)
-	otherDominates := true
-	for kVc, vVc := range vc {
-		vOther, ok := other[kVc]
-		if !ok || vOther < vVc {
-			otherDominates = false // other does not dominate
+	// Check other <= vc
+	for k, vOther := range other {
+		vVc, ok := vc[k]
+		if !ok || vOther > vVc { // If k exists in other but not vc, OR other[k] > vc[k]
+			otherLessEqVc = false
 			break
 		}
-		if vOther > vVc {
-			otherGreaterThanVc = true // Found at least one element where other is strictly greater
-		}
 	}
 
-	// Determine relationship based on dominance and strict inequality
-	if vcDominates && otherDominates {
-		// If both dominate, they must be equal
-		return 0 // Equal
-	} else if vcDominates && vcGreaterThanOther {
-		// vc dominates other, and is strictly greater in at least one element
-		return 1 // vc > other (After)
-	} else if otherDominates && otherGreaterThanVc {
-		// other dominates vc, and is strictly greater in at least one element
-		return -1 // vc < other (Before)
+	// Determine relationship
+	if vcLessEqOther && otherLessEqVc {
+		// If both <= hold, they must be equal. Check lengths for extra safety.
+		if len(vc) == len(other) {
+			return 0 // Equal
+		} else {
+			// This case implies one is a subset of the other with equal values where keys overlap.
+			// e.g., {1:1} vs {1:1, 2:1}. Here {1:1} <= {1:1, 2:1} but not vice-versa.
+			// The logic below should handle this via the strict inequality check.
+			// If we reach here, it means vc <= other AND other <= vc, which implies Equal by definition.
+			return 0 // Equal
+		}
+	} else if vcLessEqOther {
+		// vc <= other, but not equal. Check if there's *strict* inequality.
+		strictlyLess := false
+		for k, vOther := range other {
+			vVc, ok := vc[k]
+			if !ok || vVc < vOther { // If k exists in other but not vc, OR vc[k] < other[k]
+				strictlyLess = true
+				break
+			}
+		}
+		if strictlyLess {
+			return -1 // Before (vc < other)
+		} else {
+			// vc <= other but not strictly less. This implies Equal, but the first check failed.
+			// This path might indicate an issue or edge case, treat as Concurrent for safety?
+			// Or re-evaluate: If vc <= other and not other <= vc, it MUST be Before.
+			return -1 // Before
+		}
+	} else if otherLessEqVc {
+		// other <= vc, but not equal. Check if there's *strict* inequality.
+		strictlyLess := false
+		for k, vVc := range vc {
+			vOther, ok := other[k]
+			if !ok || vOther < vVc { // If k exists in vc but not other, OR other[k] < vc[k]
+				strictlyLess = true
+				break
+			}
+		}
+		if strictlyLess {
+			return 1 // After (vc > other)
+		} else {
+			// other <= vc but not strictly less. Similar to above, implies Equal or an edge case.
+			// If other <= vc and not vc <= other, it MUST be After.
+			return 1 // After
+		}
 	} else {
-		// Neither dominates the other, or one dominates but isn't strictly greater (implies equality, handled above)
+		// Neither vc <= other nor other <= vc
 		return 2 // Concurrent
 	}
 }

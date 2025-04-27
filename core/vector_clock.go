@@ -57,9 +57,9 @@ func (vc NodeVectorClock) Merge(other NodeVectorClock) {
 }
 
 // Compare determines the causal relationship between two node vector clocks (vc and other).
-// Corrected logic based on vector clock comparison rules.
+// Revised logic based on standard vector clock comparison rules.
 func (vc NodeVectorClock) Compare(other NodeVectorClock) Causality {
-	// Handle nil cases consistently by treating nil as an empty clock
+	// Treat nil clocks as empty for comparison robustness
 	if vc == nil {
 		vc = make(NodeVectorClock)
 	}
@@ -67,35 +67,78 @@ func (vc NodeVectorClock) Compare(other NodeVectorClock) Causality {
 		other = make(NodeVectorClock)
 	}
 
-	vcLessEqOther := true // Assume vc <= other initially
-	otherLessEqVc := true // Assume other <= vc initially
+	vcLessEqOther := true      // vc <= other
+	otherLessEqVc := true      // other <= vc
+	vcStrictlyLess := false    // vc < other (at least one element is strictly less)
+	otherStrictlyLess := false // other < vc (at least one element is strictly less)
 
-	// Check vc <= other condition
-	for k, vVc := range vc {
-		vOther, ok := other[k]
-		if !ok || vVc > vOther { // If key k is in vc but not other, or vc[k] > other[k]
+	// Combine all unique node IDs from both clocks
+	allNodeIDs := make(map[NodeID]struct{})
+	for id := range vc {
+		allNodeIDs[id] = struct{}{}
+	}
+	for id := range other {
+		allNodeIDs[id] = struct{}{}
+	}
+
+	for id := range allNodeIDs {
+		vcTs, vcOk := vc[id]
+		otherTs, otherOk := other[id]
+
+		// Check vc <= other condition
+		if vcOk && (!otherOk || vcTs > otherTs) {
 			vcLessEqOther = false
-			break
 		}
-	}
-
-	// Check other <= vc condition
-	for k, vOther := range other {
-		vVc, ok := vc[k]
-		if !ok || vOther > vVc { // If key k is in other but not vc, or other[k] > vc[k]
+		// Check other <= vc condition
+		if otherOk && (!vcOk || otherTs > vcTs) {
 			otherLessEqVc = false
-			break
+		}
+
+		// Check for strict inequality
+		if vcOk && otherOk {
+			if vcTs < otherTs {
+				vcStrictlyLess = true
+			}
+			if otherTs < vcTs {
+				otherStrictlyLess = true
+			}
+		} else if !vcOk && otherOk { // Key only in other, implies 0 < otherTs
+			vcStrictlyLess = true
+		} else if vcOk && !otherOk { // Key only in vc, implies vcTs > 0
+			otherStrictlyLess = true
+		}
+
+		// Optimization: if neither can be less than or equal to the other, they are concurrent
+		if !vcLessEqOther && !otherLessEqVc {
+			return Concurrent
 		}
 	}
 
-	// Determine relationship based on comparisons
+	// Final determination based on flags
 	if vcLessEqOther && otherLessEqVc {
-		return Equal
-	} else if vcLessEqOther { // vc <= other, and since not equal, vc must be strictly Before other
-		return Before
-	} else if otherLessEqVc { // other <= vc, and since not equal, other must be strictly Before vc (so vc is After)
-		return After
-	} else { // Neither vc <= other nor other <= vc
+		return Equal // If vc <= other AND other <= vc, they must be equal
+	} else if vcLessEqOther && vcStrictlyLess {
+		return Before // vc <= other AND there is at least one element vc[k] < other[k]
+	} else if otherLessEqVc && otherStrictlyLess {
+		return After // other <= vc AND there is at least one element other[k] < vc[k]
+	} else {
+		// This handles cases like vc={1:1}, other={1:1, 2:1} where vc <= other but not strictly less.
+		// Or vc={1:1, 2:1}, other={1:1} where other <= vc but not strictly less.
+		// If one is a subset but not strictly smaller, the <= condition holds, but the strict flag doesn't.
+		// If vc <= other but not strictly less, it means they are Equal or vc is Before (but not strictly).
+		// If other <= vc but not strictly less, it means they are Equal or vc is After (but not strictly).
+		// The Equal case is handled above. If we reach here, it means one direction holds (e.g., vc <= other)
+		// but the strict condition didn't trigger (vcStrictlyLess is false).
+		// This implies vc is Before other (but not strictly less in all dimensions where both exist).
+		// Let's refine the return conditions based purely on <= flags:
+		if vcLessEqOther { // We already know they are not Equal
+			return Before
+		}
+		if otherLessEqVc { // We already know they are not Equal
+			return After
+		}
+
+		// If neither <= holds, it must be Concurrent (this should have been caught by the optimization)
 		return Concurrent
 	}
 }
