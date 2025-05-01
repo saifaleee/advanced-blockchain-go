@@ -184,7 +184,7 @@ func (vm *ValidatorManager) FinalizeBlockDBFT(block *Block, shardID uint64) (*Si
 	}
 
 	// Calculate adaptive threshold based on total reputation
-	thresholdReputation := vm.calculateAdaptiveThreshold(eligibleValidators)
+	thresholdReputation := vm.CalculateAdaptiveThreshold(eligibleValidators)
 	totalEligibleReputation := int64(0)
 	for _, v := range eligibleValidators {
 		totalEligibleReputation += v.Reputation.Load()
@@ -303,9 +303,9 @@ func (vm *ValidatorManager) FinalizeBlockDBFT(block *Block, shardID uint64) (*Si
 	return signedBlock, fmt.Errorf("dBFT consensus failed for block %s on shard %d (%d/%d reputation)", block.Hash, shardID, votesReputation, thresholdReputation)
 }
 
-// calculateAdaptiveThreshold calculates the consensus threshold based on total reputation.
+// CalculateAdaptiveThreshold calculates the consensus threshold based on total reputation.
 // Returns the minimum reputation required to reach consensus (> 2/3 of total eligible reputation).
-func (vm *ValidatorManager) calculateAdaptiveThreshold(eligibleValidators []*Validator) int64 {
+func (vm *ValidatorManager) CalculateAdaptiveThreshold(eligibleValidators []*Validator) int64 { // Renamed from calculateAdaptiveThreshold
 	if len(eligibleValidators) == 0 {
 		return 0
 	}
@@ -318,7 +318,10 @@ func (vm *ValidatorManager) calculateAdaptiveThreshold(eligibleValidators []*Val
 		return 0
 	}
 
-	threshold := (totalReputation * 2 / 3)
+	// Calculate threshold: floor(totalReputation * 2 / 3)
+	// Use big.Int for potentially large reputation sums to avoid overflow if necessary,
+	// but int64 is likely sufficient for now.
+	threshold := (totalReputation * 2) / 3
 
 	return threshold
 }
@@ -422,7 +425,7 @@ func (vm *ValidatorManager) VerifyResponse(nodeID NodeID, responseData Signature
 	vm.ChallengeMu.Lock() // Lock challenge map
 	pending, exists := vm.PendingChallenges[nodeID]
 	if exists {
-		delete(vm.PendingChallenges, nodeID) // Remove challenge once processed
+		delete(vm.PendingChallenges, nodeID) // Corrected delete call
 	}
 	vm.ChallengeMu.Unlock()
 
