@@ -118,7 +118,22 @@ func VerifyWithPublicKey(publicKey *ecdsa.PublicKey, input []byte, vrfOutput *VR
 		log.Printf("[VRF Verify] ECDSA verification failed. Hash(Input)=Output: %x, r: %x, s: %x", vrfOutput.Output, r.Bytes(), s.Bytes())
 		return false
 	}
+	// Inside vrf.go -> VerifyWithPublicKey
+	// ... after extracting r, s ...
 
+	// --- Add Detailed Debug Log ---
+	log.Printf("[VRF Verify DEBUG] Verifying Hash: %x", vrfOutput.Output)
+	log.Printf("[VRF Verify DEBUG] With r: %x, s: %x", r.Bytes(), s.Bytes())
+	log.Printf("[VRF Verify DEBUG] Using PubKey X: %x", publicKey.X.Bytes())
+	log.Printf("[VRF Verify DEBUG] Using PubKey Y: %x", publicKey.Y.Bytes())
+	// --- End Debug Log ---
+
+	// isValid is already assigned above before the debug logs
+	if !isValid {
+		// Keep the original log for failure indication
+		log.Printf("[VRF Verify] ECDSA verification failed. Hash(Input)=Output: %x, r: %x, s: %x", vrfOutput.Output, r.Bytes(), s.Bytes())
+		return false
+	}
 	// log.Printf("[VRF Verify] Proof verification succeeded.")
 	return true
 }

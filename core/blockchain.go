@@ -477,19 +477,25 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) { // Remove
 
 	parentMismatch := false
 	if isFirstRealBlock {
-		// First block's PrevBlockHash should be empty []byte{}
-		// Note: Genesis blocks might be added separately. If chain is empty, this IS the first block.
-		if len(finalizedBlock.Header.PrevBlockHash) != 0 && len(currentChain) == 0 {
+		// --- FIX START: Correct logic for adding H:1 ---
+		if len(currentChain) == 0 {
+			// This case should ideally not happen if genesis blocks are added first.
 			parentMismatch = true
-			log.Printf("[Blockchain] CRITICAL: Shard %d: First block H:1 has non-empty PrevBlockHash (%x) for empty chain. Discarding.",
-				shardID, safeSlice(finalizedBlock.Header.PrevBlockHash, 4))
+			log.Printf("[Blockchain] CRITICAL: Shard %d: Proposing H:1 but chain map is unexpectedly empty (Genesis missing?). Discarding.", shardID)
+		} else {
+			// Chain is not empty, expect H:0 as the head
+			genesisBlock := currentChain[len(currentChain)-1]
+			if genesisBlock.Header.Height != 0 {
+				parentMismatch = true
+				log.Printf("[Blockchain] CRITICAL: Shard %d: Proposing H:1 but chain head is not H:0 (found H:%d). Discarding.", shardID, genesisBlock.Header.Height)
+			} else if !bytes.Equal(genesisBlock.Hash, finalizedBlock.Header.PrevBlockHash) {
+				// Check if H:1 correctly points to the hash of H:0
+				parentMismatch = true
+				log.Printf("[Blockchain] CRITICAL: Shard %d: Proposed block H:1 (Prev: %x) does not link to Genesis H:0 (Hash:%x). Discarding.",
+					shardID, safeSlice(finalizedBlock.Header.PrevBlockHash, 4), safeSlice(genesisBlock.Hash, 4))
+			}
 		}
-		// If chain is NOT empty, but we are adding H:1, something is wrong (e.g., duplicate genesis)
-		if len(currentChain) != 0 {
-			parentMismatch = true
-			log.Printf("[Blockchain] CRITICAL: Shard %d: Attempting to add first block H:1 but chain map is not empty (len:%d, Head H:%d). Discarding.",
-				shardID, len(currentChain), currentChain[len(currentChain)-1].Header.Height)
-		}
+		// --- FIX END ---
 	} else { // Block height > 1
 		if len(currentChain) == 0 {
 			parentMismatch = true
@@ -503,20 +509,18 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) { // Remove
 		}
 	}
 
+	// If parentMismatch is true, return error BEFORE adding to chain
 	if parentMismatch {
-		bc.ChainMu.Unlock()
-		// --- 2PC Integration Point (Ticket 3) ---
-		// If block is discarded due to linkage error *after* commit phase logic,
-		// this is a critical state inconsistency. May need manual intervention or complex rollback.
-		// For now, just log the error.
-		log.Printf("[2PC CRITICAL] Shard %d: Block H:%d discarded due to linkage error after 2PC commit logic executed!", shardID, finalizedBlock.Header.Height)
-		// --- End 2PC Critical Note ---
+		bc.ChainMu.Unlock() // Unlock before returning error
+		// Log 2PC error if applicable
+		log.Printf("[2PC CRITICAL] Shard %d: Block H:%d discarded due to linkage error!", shardID, finalizedBlock.Header.Height)
 		return nil, fmt.Errorf("proposed block H:%d for shard %d does not link correctly to the chain", finalizedBlock.Header.Height, shardID)
 	}
 
+	// Add block only if parent match is okay
 	bc.BlockChains[shardID] = append(bc.BlockChains[shardID], finalizedBlock)
 	chainLen := len(bc.BlockChains[shardID])
-	bc.ChainMu.Unlock()
+	bc.ChainMu.Unlock() // Unlock after successful addition
 
 	// Update shard metrics
 	shard.Metrics.BlockCount.Add(1)
