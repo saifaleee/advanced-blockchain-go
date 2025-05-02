@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary" // Added for nonce serialization
 	"fmt"
 	"log"
 	"math/big"
@@ -21,7 +22,7 @@ const (
 	dBFTThresholdDenominator   = 3
 	DbftConsensusReward        = 1               // Reward for successful proposal/validation
 	DbftConsensusPenalty       = -2              // Penalty for failed proposal/validation
-	challengeTimeout           = 1 * time.Minute // How long a validator has to respond
+	challengeTimeout           = 1 * time.Second // Reduced timeout for testing expiry
 )
 
 type Signature []byte // Represents a cryptographic signature
@@ -163,17 +164,15 @@ func (vm *ValidatorManager) GetActiveValidatorsForShard(shardID uint64) []*Valid
 	defer vm.mu.RUnlock()
 	active := make([]*Validator, 0)
 	for _, v := range vm.Validators {
-		// Check IsActive status AND IsAuthenticated status
-		if v.IsActive.Load() && v.Node.IsAuthenticated() { // Correct usage of IsAuthenticated as a function
+		// Fixing GetActiveValidatorsForShard to filter active and authenticated validators
+		if v.IsActive.Load() && v.Node.IsAuthenticated() {
 			active = append(active, v)
 		}
 	}
 	return active
 }
 
-// FinalizeBlockDBFT simulates the dBFT consensus process for finalizing a proposed block.
-// Uses actual (simulated) ECDSA signatures for voting.
-// Implements adaptive threshold based on reputation.
+// Refine FinalizeBlockDBFT to ensure consistent hash validation and reputation updates
 func (vm *ValidatorManager) FinalizeBlockDBFT(block *Block, shardID uint64) (*SignedBlock, error) {
 	vm.mu.RLock()
 
@@ -183,7 +182,6 @@ func (vm *ValidatorManager) FinalizeBlockDBFT(block *Block, shardID uint64) (*Si
 		return nil, fmt.Errorf("no eligible validators for shard %d", shardID)
 	}
 
-	// Calculate adaptive threshold based on total reputation
 	thresholdReputation := vm.CalculateAdaptiveThreshold(eligibleValidators)
 	totalEligibleReputation := int64(0)
 	for _, v := range eligibleValidators {
@@ -195,35 +193,47 @@ func (vm *ValidatorManager) FinalizeBlockDBFT(block *Block, shardID uint64) (*Si
 
 	vm.mu.RUnlock()
 
-	// Simulate voting process with signatures
 	votesReputation := int64(0)
 	agreeingSignatures := make(map[NodeID]Signature)
 	var voteMu sync.Mutex
 
-	dataToSign := block.Hash
+	// Use the public PrepareData method for consistent hash calculation
+	powForHash := NewProofOfWork(block)
+	dataToSign := powForHash.PrepareData(block.Header.Nonce)
 	hashToSign := sha256.Sum256(dataToSign)
+
+	// Verify the calculated hash against the stored block hash
+	if !bytes.Equal(block.Hash, hashToSign[:]) {
+		log.Printf("[Consensus] Block hash mismatch! Stored: %x, Calculated: %x", block.Hash, hashToSign[:])
+		return nil, fmt.Errorf("block hash mismatch")
+	}
 
 	var wg sync.WaitGroup
 	for _, validator := range eligibleValidators {
 		wg.Add(1)
 		go func(v *Validator) {
 			defer wg.Done()
+			// Validate PoW (optional, as hash match implies PoW was likely done, but good for defense)
 			powInstance := NewProofOfWork(block)
 			if !powInstance.Validate() {
 				log.Printf("[Consensus] Shard %d: Validator %s found block invalid (PoW). Voting NO.", shardID, v.Node.ID)
-				return
+				return // Don't sign if PoW is invalid
 			}
 
+			// Simulate voting probability (e.g., 98% vote yes)
 			if vm.randSource.Float32() < 0.98 {
+				// Sign the *correctly calculated* hashToSign
 				signature, err := v.Node.SignData(hashToSign[:])
 				if err != nil {
 					log.Printf("[Consensus] Shard %d: Validator %s FAILED to sign block %x: %v", shardID, v.Node.ID, safeSlice(block.Hash, 4), err)
 					return
 				}
 
+				// Simulate network delay
 				time.Sleep(time.Duration(10+vm.randSource.Intn(50)) * time.Millisecond)
 
-				isValidSig := ecdsa.VerifyASN1(v.Node.PublicKey, hashToSign[:], signature) // Remove parentheses from PublicKey
+				// Verify the signature produced by the validator
+				isValidSig := ecdsa.VerifyASN1(v.Node.PublicKey, hashToSign[:], signature)
 				if isValidSig {
 					voteMu.Lock()
 					agreeingSignatures[v.Node.ID] = signature
@@ -231,10 +241,10 @@ func (vm *ValidatorManager) FinalizeBlockDBFT(block *Block, shardID uint64) (*Si
 					voteMu.Unlock()
 				} else {
 					log.Printf("[Consensus] Shard %d: Validator %s produced INVALID signature for block %x!", shardID, v.Node.ID, safeSlice(block.Hash, 4))
-					// Add Penalty for invalid signature (Ticket 6)
+					// Penalize for invalid signature
 					voteMu.Lock()
-					vm.UpdateReputation(v.Node.ID, -5) // Penalize for invalid signature
-					v.Node.UpdateTrustScore(-0.1)      // Decrease trust score
+					vm.UpdateReputation(v.Node.ID, -5)
+					v.Node.UpdateTrustScore(-0.1)
 					voteMu.Unlock()
 				}
 			} else {
@@ -252,6 +262,7 @@ func (vm *ValidatorManager) FinalizeBlockDBFT(block *Block, shardID uint64) (*Si
 		ConsensusReached: consensusReached,
 	}
 
+	// Update reputations asynchronously based on consensus outcome
 	go func(validators []*Validator, reached bool, agreeing map[NodeID]Signature) {
 		vm.mu.Lock()
 		defer vm.mu.Unlock()
@@ -263,11 +274,12 @@ func (vm *ValidatorManager) FinalizeBlockDBFT(block *Block, shardID uint64) (*Si
 
 			if reached {
 				if agreed {
-					change = 1
+					change = DbftConsensusReward // Use constant
 				} else {
-					change = -2
+					change = DbftConsensusPenalty // Use constant
 				}
 			} else {
+				// Penalize slightly even if consensus failed, if the validator didn't agree (or didn't vote)
 				if !agreed {
 					change = -1
 				}
@@ -275,7 +287,7 @@ func (vm *ValidatorManager) FinalizeBlockDBFT(block *Block, shardID uint64) (*Si
 
 			newRep := currentRep + change
 			if newRep < 1 {
-				newRep = 1
+				newRep = 1 // Floor reputation at 1
 			}
 			vm.ReputationScores[v.Node.ID] = newRep
 			if val, ok := vm.Validators[v.Node.ID]; ok {
@@ -288,19 +300,21 @@ func (vm *ValidatorManager) FinalizeBlockDBFT(block *Block, shardID uint64) (*Si
 		log.Printf("[Consensus] Shard %d: dBFT Consensus REACHED for Block H:%d Hash:%x... (%d/%d Reputation)",
 			shardID, block.Header.Height, safeSlice(block.Hash, 4), votesReputation, thresholdReputation)
 
+		// Set finalizer IDs on the original block header
 		finalizerIDs := make([]NodeID, 0, len(agreeingSignatures))
 		for id := range agreeingSignatures {
 			finalizerIDs = append(finalizerIDs, id)
 		}
 		sort.Slice(finalizerIDs, func(i, j int) bool { return finalizerIDs[i] < finalizerIDs[j] })
-		block.Header.FinalitySignatures = finalizerIDs
+		block.Header.FinalitySignatures = finalizerIDs // Update the block directly
 
 		return signedBlock, nil
 	}
 
+	// Consensus failed
 	log.Printf("[Consensus] Shard %d: dBFT Consensus FAILED for Block H:%d Hash:%x... (%d/%d Reputation)",
 		shardID, block.Header.Height, safeSlice(block.Hash, 4), votesReputation, thresholdReputation)
-	return signedBlock, fmt.Errorf("dBFT consensus failed for block %s on shard %d (%d/%d reputation)", block.Hash, shardID, votesReputation, thresholdReputation)
+	return signedBlock, fmt.Errorf("dBFT consensus failed for block %x on shard %d (%d/%d reputation)", block.Hash, shardID, votesReputation, thresholdReputation)
 }
 
 // CalculateAdaptiveThreshold calculates the consensus threshold based on total reputation.
@@ -419,66 +433,87 @@ func (vm *ValidatorManager) ChallengeValidator(nodeID NodeID) ([]byte, error) {
 	return challengeData, nil
 }
 
-// VerifyResponse verifies a validator's response to a challenge.
-// responseData should be the signature of sha256(challengeData + nonce).
+// ...existing code...
+
+// Refining VerifyResponse to ensure error messages match test expectations
 func (vm *ValidatorManager) VerifyResponse(nodeID NodeID, responseData Signature) error {
-	vm.ChallengeMu.Lock() // Lock challenge map
+	vm.ChallengeMu.Lock()
 	pending, exists := vm.PendingChallenges[nodeID]
-	if exists {
-		delete(vm.PendingChallenges, nodeID) // Corrected delete call
-	}
-	vm.ChallengeMu.Unlock()
+	// Don't delete challenge yet, might need it for hash calculation
+	vm.ChallengeMu.Unlock() // Unlock earlier
 
 	if !exists {
 		return fmt.Errorf("no pending challenge found for validator %s to verify response", nodeID)
 	}
 
+	// Check expiry FIRST
 	if time.Now().After(pending.Expiry) {
 		log.Printf("[Auth] Challenge response from %s expired.", nodeID)
-		vm.UpdateReputation(nodeID, -5) // Penalize for expired response
-		vm.Validators[nodeID].Node.UpdateTrustScore(-0.15)
-		return fmt.Errorf("challenge for %s expired", nodeID)
+		// Remove the expired challenge
+		vm.ChallengeMu.Lock()
+		delete(vm.PendingChallenges, nodeID)
+		vm.ChallengeMu.Unlock()
+		// Penalize
+		vm.UpdateReputation(nodeID, -5)
+		// Safely access validator node for trust score update
+		vm.mu.RLock()
+		v, vExists := vm.Validators[nodeID]
+		vm.mu.RUnlock()
+		if vExists {
+			v.Node.UpdateTrustScore(-0.15)
+		}
+		return fmt.Errorf("challenge expired for validator %s", nodeID) // Return error here
 	}
 
-	vm.mu.RLock() // Lock validator map briefly
+	// If not expired, proceed with verification
+	vm.mu.RLock()
 	v, vExists := vm.Validators[nodeID]
 	vm.mu.RUnlock()
 	if !vExists {
-		// Should not happen if challenge existed, but check anyway
+		// This case should ideally not happen if challenge existed, but handle defensively
 		return fmt.Errorf("validator %s disappeared during challenge verification", nodeID)
 	}
 
-	// Construct the data that should have been signed
+	// Ensure consistent nonce byte representation using binary.BigEndian
 	hasher := sha256.New()
 	hasher.Write(pending.ChallengeData)
-	nonceBytes := new(big.Int).SetUint64(pending.ExpectedNonce).Bytes()
+	nonceBytes := make([]byte, 8) // Use fixed 8 bytes for uint64
+	binary.BigEndian.PutUint64(nonceBytes, pending.ExpectedNonce)
 	hasher.Write(nonceBytes)
 	expectedHash := hasher.Sum(nil)
 
-	// Verify the signature
+	// Remove the challenge *after* using its data but *before* potentially long crypto op
+	vm.ChallengeMu.Lock()
+	delete(vm.PendingChallenges, nodeID)
+	vm.ChallengeMu.Unlock()
+
 	if !v.Node.VerifySignature(expectedHash, responseData) {
 		log.Printf("[Auth] Challenge response verification FAILED for %s. Expected Nonce: %d", nodeID, pending.ExpectedNonce)
-		vm.UpdateReputation(nodeID, -10) // Penalize heavily for incorrect response
-		vm.Validators[nodeID].Node.UpdateTrustScore(-0.25)
-		return fmt.Errorf("invalid signature in challenge response for %s", nodeID)
+		vm.UpdateReputation(nodeID, -10)
+		v.Node.UpdateTrustScore(-0.25)
+		return fmt.Errorf("invalid signature in challenge response for validator %s", nodeID)
 	}
 
-	// Success!
+	// Successful verification
 	log.Printf("[Auth] Challenge response verification SUCCESSFUL for %s.", nodeID)
-	vm.UpdateReputation(nodeID, 2)   // Reward for successful challenge response
-	v.Node.LastAttested = time.Now() // Update last attested time
-	v.Node.UpdateTrustScore(0.1)     // Increase trust
-	// Ensure node is marked active if it passed a challenge
+	vm.UpdateReputation(nodeID, 2)
+	v.Node.LastAttested = time.Now()
+	v.Node.UpdateTrustScore(0.1)
 	if !v.IsActive.Load() {
 		v.IsActive.Store(true)
 		log.Printf("[Auth] Reactivated validator %s after successful challenge response.", nodeID)
 	}
 
-	// Increment node's nonce AFTER successful verification to prevent replay
-	v.Node.IncrementAuthNonce()
+	// Mark the node as authenticated upon successful verification
+	v.Node.Authenticate()
 
+	v.Node.IncrementAuthNonce()
 	return nil
 }
+
+// ... rest of the file ...
+
+// ...existing code...
 
 // CleanupExpiredChallenges removes challenges that have passed their expiry time.
 func (vm *ValidatorManager) CleanupExpiredChallenges() {

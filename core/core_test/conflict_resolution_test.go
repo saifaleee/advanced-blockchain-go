@@ -504,7 +504,8 @@ func TestHandlePotentialConflict(t *testing.T) {
 		remote := core.StateVersion{Key: key, Value: "valRemote", VectorClock: remoteVC, SourceNode: nodeB}
 
 		// Determine VRF winner using the *actual* simulation logic (SHA256 based)
-		sortedVersions := []core.StateVersion{local, remote}
+		// This calculation MUST match the internal logic of ResolveConflictVRF
+		sortedVersions := []core.StateVersion{local, remote} // nodeA, nodeB
 		sort.Slice(sortedVersions, func(i, j int) bool {
 			return sortedVersions[i].SourceNode < sortedVersions[j].SourceNode
 		})
@@ -521,18 +522,19 @@ func TestHandlePotentialConflict(t *testing.T) {
 		simulatedRandomValue := new(big.Int).SetBytes(simulatedHash[:])
 		// Calculate winner index based on the simulated value
 		winnerIndex := int(new(big.Int).Mod(simulatedRandomValue, big.NewInt(int64(len(sortedVersions)))).Int64())
-		expectedWinner := sortedVersions[winnerIndex] // Use the correctly calculated winner index
+		// Based on logs, winnerIndex is 0 (nodeA) for this input hash 8b3e...
+		expectedWinner := sortedVersions[winnerIndex] // Use the correctly calculated winner index (nodeA)
 
 		resolved := resolver.HandlePotentialConflict(local, remote, vrfContext)
 
-		// Expected: VRF winner (should be remote/nodeB based on logs), clock is merged
-		expectedVC := core.VectorClock{uint64(1): 1, uint64(2): 1, uint64(3): 2} // Merge takes max
-		expected := expectedWinner                                               // This should now correctly be the remote version
+		// Expected: VRF winner (nodeA based on logs), clock is merged
+		expectedVC := core.VectorClock{uint64(1): 1, uint64(2): 1, uint64(3): 2} // Merge takes max {1:1, 3:1} and {2:1, 3:2} -> {1:1, 2:1, 3:2}
+		expected := expectedWinner                                               // This is now nodeA's version
 		expected.VectorClock = expectedVC                                        // Function should set the merged clock
 
 		// Assertions should now pass as expectedWinner is calculated using the same logic as the function under test
-		assert.Equal(t, expectedWinner.Value, resolved.Value, "Should return VRF winner value")
+		assert.Equal(t, expectedWinner.Value, resolved.Value, "Should return VRF winner value") // Expect "valLocal"
 		assert.Equal(t, expectedVC, resolved.VectorClock, "Should return merged vector clock")
-		assert.Equal(t, expected, resolved) // Expect remote StateVersion with merged clock
+		assert.Equal(t, expected, resolved) // Expect local StateVersion (nodeA) with merged clock
 	})
 }

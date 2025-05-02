@@ -69,15 +69,16 @@ func (pow *ProofOfWork) Target() *big.Int {
 	return targetCopy
 }
 
-// prepareData prepares the data to be hashed for PoW.
-// It includes fields from the header EXCEPT the Nonce, Hash, and FinalitySignatures.
-// ProposerID IS included in the hash calculation.
-// VectorClock IS included in the hash calculation.
-func (pow *ProofOfWork) prepareData(nonce int64) []byte {
+// PrepareData serializes the block header fields into a deterministic byte slice for hashing.
+// This is the data used as input for the Proof-of-Work hash calculation.
+// Renamed from prepareData to make it public for consistent use.
+func (pow *ProofOfWork) PrepareData(nonce int64) []byte {
 	header := pow.block.Header
 	// Serialize VectorClock for hashing
-	vcBytes, err := header.VectorClock.Serialize() // Use the renamed field VectorClock
+	vcBytes, err := header.VectorClock.Serialize()
 	if err != nil {
+		// Log critical error, but continue with empty bytes to avoid stopping the process
+		// A more robust system might handle this differently (e.g., return error).
 		log.Printf("CRITICAL: Failed to serialize vector clock for hashing block %d: %v", header.Height, err)
 		vcBytes = []byte{}
 	}
@@ -96,7 +97,6 @@ func (pow *ProofOfWork) prepareData(nonce int64) []byte {
 			vcBytes,                          // Include serialized Vector Clock
 			[]byte(fmt.Sprintf("%d", nonce)), // Include the nonce being tried
 			header.AccumulatorState,          // Include accumulator state in hash
-			// DO NOT INCLUDE FinalitySignatures here
 		},
 		[]byte{},
 	)
@@ -115,7 +115,7 @@ func (pow *ProofOfWork) Run() (int64, []byte) {
 	maxNonce := int64(1 << 60) // Reduced max nonce slightly to prevent extreme loops
 
 	for nonce < maxNonce {
-		data := pow.prepareData(nonce)
+		data := pow.PrepareData(nonce) // Use public PrepareData
 		hash = sha256.Sum256(data)
 		hashInt.SetBytes(hash[:])
 
@@ -136,19 +136,23 @@ func (pow *ProofOfWork) Run() (int64, []byte) {
 	return nonce, hash[:]
 }
 
-// Validate checks if the block's hash is valid according to PoW.
+// Validate checks if the block's hash is valid according to the PoW target
+// and matches the hash calculated from its header data.
 func (pow *ProofOfWork) Validate() bool {
 	var hashInt big.Int
-	data := pow.prepareData(pow.block.Header.Nonce)
+	data := pow.PrepareData(pow.block.Header.Nonce) // Use public PrepareData
 	hash := sha256.Sum256(data)
 	hashInt.SetBytes(hash[:])
 
-	isValid := hashInt.Cmp(pow.target) == -1
-	if !bytes.Equal(hash[:], pow.block.Hash) {
-		log.Printf("Block %x hash mismatch! Stored: %x, Calculated: %x", pow.block.Hash, pow.block.Hash, hash[:])
-		return false
+	isValidTarget := hashInt.Cmp(pow.target) == -1 // Check if hash meets difficulty target
+
+	// Check if the calculated hash matches the hash stored in the block
+	isMatchingHash := bytes.Equal(hash[:], pow.block.Hash)
+	if !isMatchingHash {
+		log.Printf("Block %x hash mismatch during validation! Stored: %x, Calculated: %x", pow.block.Hash, pow.block.Hash, hash[:])
 	}
-	return isValid
+
+	return isValidTarget && isMatchingHash
 }
 
 // ProposeBlock creates a new block proposal via PoW, but doesn't finalize it.
@@ -301,7 +305,7 @@ func NewGenesisBlock(shardID uint64, coinbase *Transaction, difficulty int, gene
 			}
 		}
 		pow := NewProofOfWork(block)
-		block.Hash = pow.prepareData(0)
+		block.Hash = pow.PrepareData(0)
 
 	} else {
 		block.Finalize([]NodeID{genesisProposer})
@@ -361,7 +365,7 @@ func (b *Block) GetTransactionMerkleProof(txID []byte) ([][]byte, uint64, error)
 
 // Enhanced cryptographic accumulator implementation using Merkle trees
 
-// UpdateAccumulator updates the block's accumulator state using a Merkle tree.
+// Refine UpdateAccumulator to ensure consistent accumulator updates
 func (bh *BlockHeader) UpdateAccumulator(newData [][]byte) error {
 	if len(newData) == 0 {
 		return fmt.Errorf("no data provided for accumulator update")
@@ -370,10 +374,9 @@ func (bh *BlockHeader) UpdateAccumulator(newData [][]byte) error {
 	// Build a Merkle tree from the new data
 	merkleTree, err := NewMerkleTree(newData)
 	if err != nil {
-		// Handle the error appropriately, e.g., return it or log it
 		return fmt.Errorf("failed to update accumulator: %w", err)
 	}
-	bh.AccumulatorState = merkleTree.GetMerkleRoot() // Use GetMerkleRoot() instead of RootHash()
+	bh.AccumulatorState = merkleTree.GetMerkleRoot()
 	return nil
 }
 
