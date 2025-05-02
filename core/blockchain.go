@@ -73,7 +73,7 @@ func NewBlockchain(numShards int, smConfig ShardManagerConfig, bcConfig Blockcha
 	return bc, nil // Return blockchain and nil error
 }
 
-// Start begins the blockchain's background processes (like shard management).
+// Start begins the blockchain's background processes (like shard management and adversarial monitoring).
 func (bc *Blockchain) Start() {
 	// Start Consistency Manager monitoring
 	bc.wg.Add(1)
@@ -81,6 +81,59 @@ func (bc *Blockchain) Start() {
 	// Start Shard Manager monitoring
 	bc.wg.Add(1)
 	go bc.ShardManager.StartManagementLoop() // Replace Start with StartManagementLoop
+
+	// Start adversarial behavior monitoring
+	bc.wg.Add(1)
+	go func() {
+		defer bc.wg.Done()
+		ticker := time.NewTicker(30 * time.Second) // Monitor every 30 seconds
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-bc.stopChan:
+				log.Println("[Blockchain] Stopping adversarial behavior monitoring.")
+				return
+			case <-ticker.C:
+				bc.ValidatorManager.MonitorAdversarialBehavior()
+			}
+		}
+	}()
+
+	// Start periodic attestation
+	bc.wg.Add(1)
+	go func() {
+		defer bc.wg.Done()
+		ticker := time.NewTicker(1 * time.Minute) // Attest every minute
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-bc.stopChan:
+				log.Println("[Blockchain] Stopping periodic attestation.")
+				return
+			case <-ticker.C:
+				for _, validator := range bc.ValidatorManager.GetAllValidators() {
+					challenge, err := bc.ValidatorManager.ChallengeValidator(validator.Node.ID)
+					if err != nil {
+						log.Printf("[Auth] Failed to issue challenge to %s: %v", validator.Node.ID, err)
+						continue
+					}
+
+					response, err := validator.Node.Attest(challenge)
+					if err != nil {
+						log.Printf("[Auth] Failed to attest challenge for %s: %v", validator.Node.ID, err)
+						continue
+					}
+
+					err = bc.ValidatorManager.VerifyResponse(validator.Node.ID, response)
+					if err != nil {
+						log.Printf("[Auth] Failed to verify response for %s: %v", validator.Node.ID, err)
+					}
+				}
+			}
+		}
+	}()
 }
 
 // Stop gracefully shuts down the blockchain processes.
@@ -128,6 +181,125 @@ func (bc *Blockchain) AddTransaction(tx *Transaction) error {
 	return nil
 }
 
+// TwoPhaseCommit handles the prepare, commit, and abort phases for cross-shard transactions.
+func (bc *Blockchain) TwoPhaseCommit(tx *Transaction) error {
+	if tx == nil || !tx.IsCrossShard() {
+		return fmt.Errorf("invalid transaction for 2PC")
+	}
+
+	// Phase 1: Prepare
+	log.Printf("[2PC] Preparing transaction %x for cross-shard commit.", tx.ID)
+	prepared, err := bc.prepareTransaction(tx)
+	if err != nil {
+		log.Printf("[2PC] Prepare phase failed for transaction %x: %v", tx.ID, err)
+		return bc.abortTransaction(tx)
+	}
+
+	// Phase 2: Commit
+	if prepared {
+		log.Printf("[2PC] Committing transaction %x across shards.", tx.ID)
+		return bc.commitTransaction(tx)
+	}
+
+	// Abort if not prepared
+	return bc.abortTransaction(tx)
+}
+
+// prepareTransaction handles the prepare phase of 2PC.
+func (bc *Blockchain) prepareTransaction(tx *Transaction) (bool, error) {
+	// Lock resources in the source shard
+	sourceShard, ok := bc.ShardManager.GetShard(uint64(tx.FromShard))
+	if !ok {
+		return false, fmt.Errorf("source shard %d not found", tx.FromShard)
+	}
+
+	sourceShard.mu.Lock()
+	defer sourceShard.mu.Unlock()
+
+	// Validate transaction in the source shard
+	if err := sourceShard.StateDB.Put(string(tx.ID), tx.Data); err != nil {
+		return false, fmt.Errorf("failed to prepare transaction in source shard: %w", err)
+	}
+
+	// Lock resources in the destination shard
+	destShard, ok := bc.ShardManager.GetShard(uint64(tx.ToShard))
+	if !ok {
+		return false, fmt.Errorf("destination shard %d not found", tx.ToShard)
+	}
+
+	destShard.mu.Lock()
+	defer destShard.mu.Unlock()
+
+	// Simulate validation in the destination shard
+	if err := destShard.StateDB.Put(string(tx.ID), []byte("prepared")); err != nil {
+		return false, fmt.Errorf("failed to prepare transaction in destination shard: %w", err)
+	}
+
+	log.Printf("[2PC] Transaction %x prepared successfully in both shards.", tx.ID)
+	return true, nil
+}
+
+// commitTransaction handles the commit phase of 2PC.
+func (bc *Blockchain) commitTransaction(tx *Transaction) error {
+	// Commit in the source shard
+	sourceShard, ok := bc.ShardManager.GetShard(uint64(tx.FromShard))
+	if !ok {
+		return fmt.Errorf("source shard %d not found", tx.FromShard)
+	}
+
+	sourceShard.mu.Lock()
+	defer sourceShard.mu.Unlock()
+
+	// Commit in the destination shard
+	destShard, ok := bc.ShardManager.GetShard(uint64(tx.ToShard))
+	if !ok {
+		return fmt.Errorf("destination shard %d not found", tx.ToShard)
+	}
+
+	destShard.mu.Lock()
+	defer destShard.mu.Unlock()
+
+	// Finalize the transaction in both shards
+	if err := sourceShard.StateDB.Put(string(tx.ID), []byte("committed")); err != nil {
+		return fmt.Errorf("failed to commit transaction in source shard: %w", err)
+	}
+	if err := destShard.StateDB.Put(string(tx.ID), []byte("committed")); err != nil {
+		return fmt.Errorf("failed to commit transaction in destination shard: %w", err)
+	}
+
+	log.Printf("[2PC] Transaction %x committed successfully in both shards.", tx.ID)
+	return nil
+}
+
+// abortTransaction handles the abort phase of 2PC.
+func (bc *Blockchain) abortTransaction(tx *Transaction) error {
+	// Rollback in the source shard
+	sourceShard, ok := bc.ShardManager.GetShard(uint64(tx.FromShard))
+	if ok {
+		sourceShard.mu.Lock()
+		defer sourceShard.mu.Unlock()
+		_ = sourceShard.StateDB.Delete(string(tx.ID))
+	}
+
+	// Rollback in the destination shard
+	destShard, ok := bc.ShardManager.GetShard(uint64(tx.ToShard))
+	if ok {
+		destShard.mu.Lock()
+		defer destShard.mu.Unlock()
+		_ = destShard.StateDB.Delete(string(tx.ID))
+	}
+
+	log.Printf("[2PC] Transaction %x aborted in both shards.", tx.ID)
+	return nil
+}
+
+// ArchiveState persists pruned state to external storage.
+func (bc *Blockchain) ArchiveState(shardID uint64, state map[uint64][]byte) error {
+	// Simulate archival logic (e.g., write to file or database)
+	log.Printf("[Archive] Archived state for shard %d.", shardID)
+	return nil
+}
+
 // MineShardBlock coordinates the process of proposing and finalizing a block for a specific shard.
 // Includes selecting a proposer (potentially via VRF) and handling cross-shard TX states.
 func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) { // Removed proposerID argument
@@ -154,27 +326,25 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) { // Remove
 	bc.ChainMu.RUnlock()
 	nextBlockHeight := prevBlockHeight + 1
 
-	// 1.5 Select Proposer (Ticket 7 - VRF Integration Point)
-	// Use VRF to select a proposer for this specific block height
-	seed := prevBlockHash // Use prev block hash as part of the VRF seed
+	// Select proposer using VRF
+	seed := prevBlockHash // Use previous block hash as the seed
 	vrf, err := NewSecureVRF()
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize VRF: %w", err)
 	}
 
-	vrfInput := append(seed, byte(shardID), byte(nextBlockHeight))
-	vrfOutput, err := vrf.Evaluate(vrfInput)
+	proposerValidator, proof, err := vrf.SelectProposerWithProof(bc.ValidatorManager.GetActiveValidatorsForShard(shardID), seed)
 	if err != nil {
-		return nil, fmt.Errorf("failed to evaluate VRF: %w", err)
+		return nil, fmt.Errorf("failed to select proposer using VRF: %w", err)
 	}
 
-	proposerValidator, err := bc.ValidatorManager.SelectDelegateWithVRF(vrfOutput.Output, shardID, nextBlockHeight)
-	if err != nil {
-		return nil, fmt.Errorf("failed to select proposer with VRF: %w", err)
+	// Verify the VRF proof
+	if !vrf.VerifyProof(seed, proof) {
+		return nil, fmt.Errorf("invalid VRF proof for proposer selection")
 	}
 
 	proposerID := proposerValidator.Node.ID
-	log.Printf("[Blockchain] Shard %d: Selected proposer %s for H:%d.", shardID, proposerID, nextBlockHeight)
+	log.Printf("[Blockchain] Shard %d: Selected proposer %s using VRF. Proof: %x", shardID, proposerID, proof.Proof)
 
 	// 2. Get Transactions & Prepare for State Changes
 	transactions := shard.GetTransactionsForBlock(10) // Assuming max 10 TXs per block
@@ -331,6 +501,57 @@ func (bc *Blockchain) MineShardBlock(shardID uint64) (*Block, error) { // Remove
 	return finalizedBlock, nil
 }
 
+// ProposeBlock creates a new block with transactions and updates the accumulator.
+func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []byte, height uint64, stateRoot []byte, difficulty int, proposerID NodeID, prevBlockVC VectorClock) (*Block, error) {
+	// Initialize the accumulator
+	accumulator, err := NewAccumulator(2048) // Use 2048-bit RSA modulus
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize accumulator: %w", err)
+	}
+
+	// Add transactions to the accumulator
+	for _, tx := range transactions {
+		if err := accumulator.Add(tx.ID); err != nil {
+			return nil, fmt.Errorf("failed to add transaction to accumulator: %w", err)
+		}
+	}
+
+	// Create the block header
+	header := &BlockHeader{
+		ShardID:       shardID,
+		PrevBlockHash: prevBlockHash,
+		Height:        height,
+		Timestamp:     time.Now().UnixNano(),
+		StateRoot:     stateRoot,
+		ProposerID:    proposerID,
+		Accumulator:   accumulator, // Add accumulator to header
+		// Nonce and VectorClock will be set after PoW and increment
+	}
+
+	// Create the block instance (without hash initially)
+	block := &Block{
+		Header:       header,
+		Transactions: transactions,
+		// Signatures will be added after dBFT
+	}
+
+	// Perform PoW and set the Nonce and Hash
+	pow := NewProofOfWork(block) // Pass the block instance
+	nonce, hash := pow.Run()
+	block.Header.Nonce = nonce // Set Nonce on the header
+	block.Hash = hash          // Set Hash on the block itself
+
+	// Set the VectorClock
+	block.Header.VectorClock = prevBlockVC.Copy()
+	// TODO: Fix VectorClock increment type mismatch.
+	// VectorClock expects uint64, but proposerID is NodeID (string).
+	// Need a stable mapping from NodeID to uint64 or change VectorClock key type.
+	// block.Header.VectorClock.Increment(proposerID) // Temporarily commented out
+
+	// Return the new block
+	return block, nil
+}
+
 // GetBlock retrieves a block from a specific shard's chain.
 func (bc *Blockchain) GetBlock(shardID uint64, blockHash []byte) (*Block, error) {
 	bc.ChainMu.RLock()
@@ -378,52 +599,35 @@ func (bc *Blockchain) GetState(shardID uint64, key string) ([]byte, error) {
 	return value, nil
 }
 
-// PruneChain removes old blocks from a specific shard's chain in memory.
+// PruneChain removes old blocks from a specific shard's chain in memory and archives the state.
 func (bc *Blockchain) PruneChain(shardID uint64, minBlocksToKeep int) {
-	if minBlocksToKeep <= 0 {
-		return // Pruning disabled or invalid config
-	}
-
 	bc.ChainMu.Lock()
 	defer bc.ChainMu.Unlock()
 
 	chain, ok := bc.BlockChains[shardID]
-	if !ok {
-		// log.Printf("[Prune] Shard %d: Chain not found, skipping.", shardID)
-		return
+	if !ok || len(chain) <= minBlocksToKeep {
+		return // Nothing to prune
 	}
 
-	currentLen := len(chain)
-	if currentLen <= minBlocksToKeep {
-		// log.Printf("[Prune] Shard %d: Chain length %d <= %d, no pruning needed.", shardID, currentLen, minBlocksToKeep)
-		return // Not enough blocks to prune
+	// Determine the blocks to prune
+	pruneCount := len(chain) - minBlocksToKeep
+	prunedBlocks := chain[:pruneCount]
+	bc.BlockChains[shardID] = chain[pruneCount:]
+
+	// Archive the state associated with the last pruned block
+	lastPrunedBlock := prunedBlocks[len(prunedBlocks)-1]
+	shard, ok := bc.ShardManager.GetShard(shardID)
+	if ok {
+		archivePath := fmt.Sprintf("shard_%d_state_block_%d.json", shardID, lastPrunedBlock.Header.Height)
+		err := shard.StateDB.ArchiveState(archivePath)
+		if err != nil {
+			log.Printf("[Prune] Failed to archive state for shard %d at block %d: %v", shardID, lastPrunedBlock.Header.Height, err)
+		} else {
+			log.Printf("[Prune] Archived state for shard %d at block %d to %s", shardID, lastPrunedBlock.Header.Height, archivePath)
+		}
 	}
 
-	prunedCount := currentLen - minBlocksToKeep
-
-	// Add state archival logic during pruning
-	archivedStates := make(map[uint64][]byte) // Map of block height to state root
-	for i := 0; i < prunedCount; i++ {
-		block := chain[i]
-		archivedStates[block.Header.Height] = block.Header.StateRoot
-		log.Printf("[Archive] Archived state for Block H:%d with StateRoot: %x", block.Header.Height, safeSlice(block.Header.StateRoot, 4))
-	}
-	// TODO: Persist archivedStates to external storage (e.g., database, file system)
-
-	bc.BlockChains[shardID] = chain[prunedCount:] // Keep the last 'minBlocksToKeep' blocks
-
-	newLen := len(bc.BlockChains[shardID])
-	firstBlockHeight := uint64(0)
-	lastBlockHeight := uint64(0)
-	if newLen > 0 {
-		firstBlockHeight = bc.BlockChains[shardID][0].Header.Height
-		lastBlockHeight = bc.BlockChains[shardID][newLen-1].Header.Height
-	}
-
-	log.Printf("[Prune] Shard %d: Pruned %d blocks. New length: %d (Keeping H:%d to H:%d).",
-		shardID, prunedCount, newLen, firstBlockHeight, lastBlockHeight)
-
-	// TODO: State pruning would need to happen here too, based on the oldest kept block's state root.
+	log.Printf("[Prune] Pruned %d blocks from shard %d. Remaining blocks: %d", pruneCount, shardID, len(bc.BlockChains[shardID]))
 }
 
 // DisplayReputations logs the current reputation scores of all validators.

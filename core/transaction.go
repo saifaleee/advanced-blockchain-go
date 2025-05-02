@@ -98,6 +98,21 @@ func DeserializeTransaction(data []byte) (*Transaction, error) {
 	return &tx, nil
 }
 
+// MarkPrepared marks the transaction as prepared.
+func (tx *Transaction) MarkPrepared() {
+	tx.Status = "Prepared"
+}
+
+// MarkCommitted marks the transaction as committed.
+func (tx *Transaction) MarkCommitted() {
+	tx.Status = "Committed"
+}
+
+// MarkAborted marks the transaction as aborted.
+func (tx *Transaction) MarkAborted() {
+	tx.Status = "Aborted"
+}
+
 // String provides a human-readable representation of the transaction.
 func (tx *Transaction) String() string {
 	typeStr := "IntraShard"

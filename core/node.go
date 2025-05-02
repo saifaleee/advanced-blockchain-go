@@ -103,6 +103,39 @@ func (n *Node) UpdateTrustScore(change float64) {
 	fmt.Printf("[Auth] Node %s trust score updated to %.2f\n", n.ID, n.TrustScore)
 }
 
+// PenalizeTrustScore decreases the node's trust score for adversarial behavior.
+func (n *Node) PenalizeTrustScore(amount float64) {
+	n.TrustScore -= amount
+	if n.TrustScore < 0.0 {
+		n.TrustScore = 0.0
+	}
+	fmt.Printf("[Adversarial] Node %s trust score penalized by %.2f. New trust score: %.2f\n", n.ID, amount, n.TrustScore)
+}
+
+// RewardTrustScore increases the node's trust score for positive behavior.
+func (n *Node) RewardTrustScore(amount float64) {
+	n.TrustScore += amount
+	if n.TrustScore > 1.0 {
+		n.TrustScore = 1.0
+	}
+	fmt.Printf("[Trust] Node %s trust score rewarded by %.2f. New trust score: %.2f\n", n.ID, amount, n.TrustScore)
+}
+
+// Attest performs a challenge-response attestation for the node.
+func (n *Node) Attest(challenge []byte) ([]byte, error) {
+	signature, err := n.SignData(challenge)
+	if err != nil {
+		return nil, fmt.Errorf("failed to attest challenge: %w", err)
+	}
+	n.LastAttested = time.Now()
+	return signature, nil
+}
+
+// VerifyAttestation verifies the attestation response.
+func (n *Node) VerifyAttestation(challenge, response []byte) bool {
+	return n.VerifySignature(challenge, response)
+}
+
 // --- Validator --- //
 
 // Validator extends Node with reputation and active status for consensus.

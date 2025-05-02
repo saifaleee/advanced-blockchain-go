@@ -62,6 +62,86 @@ func (v *SecureVRF) Verify(input []byte, output *VRFOutput) bool {
 	return ecdsa.Verify(v.publicKey, hash[:], r, s)
 }
 
+// VerifyProof verifies the VRF proof for a given input and output.
+func (v *SecureVRF) VerifyProof(input []byte, output *VRFOutput) bool {
+	hash := sha256.Sum256(input)
+	if !bytes.Equal(hash[:], output.Output) {
+		return false
+	}
+
+	r := new(big.Int).SetBytes(output.Proof[:len(output.Proof)/2])
+	s := new(big.Int).SetBytes(output.Proof[len(output.Proof)/2:])
+	return ecdsa.Verify(v.publicKey, hash[:], r, s)
+}
+
+// SelectProposer selects a proposer using VRF.
+func (v *SecureVRF) SelectProposer(validators []*Validator, seed []byte) (*Validator, error) {
+	var bestValidator *Validator
+	var lowestValue *big.Int
+
+	for _, validator := range validators {
+		input := append(seed, []byte(validator.Node.ID)...)
+		output, err := v.Evaluate(input)
+		if err != nil {
+			return nil, fmt.Errorf("failed to evaluate VRF: %w", err)
+		}
+
+		value := new(big.Int).SetBytes(output.Output)
+		if lowestValue == nil || value.Cmp(lowestValue) < 0 {
+			lowestValue = value
+			bestValidator = validator
+		}
+	}
+
+	return bestValidator, nil
+}
+
+// SelectProposerWithProof selects a proposer using VRF and returns the proof for verification.
+func (v *SecureVRF) SelectProposerWithProof(validators []*Validator, seed []byte) (*Validator, *VRFOutput, error) {
+	var bestValidator *Validator
+	var lowestValue *big.Int
+	var bestProof *VRFOutput
+
+	for _, validator := range validators {
+		input := append(seed, []byte(validator.Node.ID)...)
+		output, err := v.Evaluate(input)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to evaluate VRF: %w", err)
+		}
+
+		value := new(big.Int).SetBytes(output.Output)
+		if lowestValue == nil || value.Cmp(lowestValue) < 0 {
+			lowestValue = value
+			bestValidator = validator
+			bestProof = output
+		}
+	}
+
+	return bestValidator, bestProof, nil
+}
+
+// SelectDelegateWithVRF selects a delegate using VRF for consensus.
+func (v *SecureVRF) SelectDelegateWithVRF(seed []byte, validators []*Validator) (*Validator, error) {
+	var bestValidator *Validator
+	var lowestValue *big.Int
+
+	for _, validator := range validators {
+		input := append(seed, []byte(validator.Node.ID)...)
+		output, err := v.Evaluate(input)
+		if err != nil {
+			return nil, fmt.Errorf("failed to evaluate VRF: %w", err)
+		}
+
+		value := new(big.Int).SetBytes(output.Output)
+		if lowestValue == nil || value.Cmp(lowestValue) < 0 {
+			lowestValue = value
+			bestValidator = validator
+		}
+	}
+
+	return bestValidator, nil
+}
+
 // equal compares two byte slices for equality.
 func equal(a, b []byte) bool {
 	if len(a) != len(b) {

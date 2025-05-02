@@ -2,7 +2,11 @@ package core
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
+	"os"
 	"sort"
 	"sync"
 )
@@ -14,8 +18,9 @@ type StateDB interface {
 	Delete(key string) error
 	GetKeys() ([]string, error) // Return keys as strings
 	Clear() error
-	Size() int                     // Add Size method
-	GetStateRoot() ([]byte, error) // Add GetStateRoot method
+	Size() int                          // Add Size method
+	GetStateRoot() ([]byte, error)      // Add GetStateRoot method
+	ArchiveState(filePath string) error // Add ArchiveState method
 }
 
 // InMemoryStateDB provides a simple in-memory implementation of StateDB.
@@ -116,4 +121,55 @@ func (db *InMemoryStateDB) GetStateRoot() ([]byte, error) {
 	}
 
 	return hasher.Sum(nil), nil
+}
+
+// ArchiveState persists the state to a specified file path.
+func (db *InMemoryStateDB) ArchiveState(filePath string) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	// Serialize the state to JSON
+	data, err := json.MarshalIndent(db.data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to serialize state: %w", err)
+	}
+
+	// Write the serialized state to the file
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to create archive file: %w", err)
+	}
+	defer file.Close()
+
+	_, err = file.Write(data)
+	if err != nil {
+		return fmt.Errorf("failed to write state to archive file: %w", err)
+	}
+
+	log.Printf("[Archive] State successfully archived to %s", filePath)
+	return nil
+}
+
+// RestoreState loads the state from a specified file path.
+func (db *InMemoryStateDB) RestoreState(filePath string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	// Read the file content
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to read archive file: %w", err)
+	}
+
+	// Deserialize the JSON content into the state map
+	var restoredData map[string][]byte
+	err = json.Unmarshal(data, &restoredData)
+	if err != nil {
+		return fmt.Errorf("failed to deserialize state: %w", err)
+	}
+
+	// Replace the current state with the restored state
+	db.data = restoredData
+	log.Printf("[Archive] State successfully restored from %s", filePath)
+	return nil
 }

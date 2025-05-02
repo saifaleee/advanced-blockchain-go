@@ -433,7 +433,52 @@ func (vm *ValidatorManager) ChallengeValidator(nodeID NodeID) ([]byte, error) {
 	return challengeData, nil
 }
 
-// ...existing code...
+// SlashValidator penalizes a validator for adversarial behavior.
+func (vm *ValidatorManager) SlashValidator(nodeID NodeID, reason string) {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+
+	validator, exists := vm.Validators[nodeID]
+	if !exists {
+		log.Printf("[Slashing] Validator %s not found.", nodeID)
+		return
+	}
+
+	// Decrease reputation and log the reason
+	validator.Reputation.Add(-20) // Apply a significant penalty
+	log.Printf("[Slashing] Validator %s slashed for reason: %s. New reputation: %d", nodeID, reason, validator.Reputation.Load())
+
+	// Mark the validator as inactive if reputation falls below a critical threshold
+	if validator.Reputation.Load() < 10 {
+		validator.IsActive.Store(false)
+		log.Printf("[Slashing] Validator %s marked as inactive due to low reputation.", nodeID)
+	}
+
+	// Adjust trust score
+	validator.Node.UpdateTrustScore(-0.5)
+}
+
+// MonitorAdversarialBehavior monitors validators for adversarial behavior and applies slashing if necessary.
+func (vm *ValidatorManager) MonitorAdversarialBehavior() {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+
+	for _, validator := range vm.Validators {
+		// Example: Check for repeated invalid signatures or failure to participate
+		if validator.Reputation.Load() < 15 && validator.IsActive.Load() {
+			log.Printf("[Adversarial] Validator %s flagged for potential adversarial behavior.", validator.Node.ID)
+			vm.SlashValidator(validator.Node.ID, "Repeated invalid actions or failure to participate")
+		}
+	}
+}
+
+// VerifyAndSlash checks a validator's behavior during consensus and applies slashing if necessary.
+func (vm *ValidatorManager) VerifyAndSlash(nodeID NodeID, isValid bool, reason string) {
+	if !isValid {
+		log.Printf("[Adversarial] Validator %s produced invalid behavior: %s", nodeID, reason)
+		vm.SlashValidator(nodeID, reason)
+	}
+}
 
 // Refining VerifyResponse to ensure error messages match test expectations
 func (vm *ValidatorManager) VerifyResponse(nodeID NodeID, responseData Signature) error {
@@ -510,10 +555,6 @@ func (vm *ValidatorManager) VerifyResponse(nodeID NodeID, responseData Signature
 	v.Node.IncrementAuthNonce()
 	return nil
 }
-
-// ... rest of the file ...
-
-// ...existing code...
 
 // CleanupExpiredChallenges removes challenges that have passed their expiry time.
 func (vm *ValidatorManager) CleanupExpiredChallenges() {

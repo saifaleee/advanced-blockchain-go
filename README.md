@@ -39,57 +39,42 @@ The vision is to push the boundaries of blockchain design by focusing on:
     *   Implementation of shard metrics tracking (transaction count, state size, block count).
     *   Automatic shard split algorithm when load thresholds are exceeded.
     *   Automatic shard merge algorithm for underutilized shards.
-    *   Robust fallback routing mechanism for transactions targeting non-existent shards (e.g., after merge).
-    *   Management loop for continuous monitoring and dynamic shard adjustments.
-    *   Efficient state migration during shard splits with load balancing.
-    *   Automatic (lazy) blockchain initialization for newly created shards during the first mining attempt.
     *   Resolved deadlocks related to concurrent shard management and block mining.
-*   **Cross-Shard Transactions (Ticket 3 partial - Phase 3 & 6):**
+*   **Cross-Shard Transactions (Ticket 3 - Phase 3 & 6):**
     *   Implemented and tested cross-shard transaction flow (Initiate/Finalize).
-    *   Transaction initiation in source shard with routing of finalization TX to destination shard.
-    *   Finalization transaction processing in destination shard.
-    *   *Added comments/placeholders for future 2PC integration (Phase 6).*
-*   **Merkle Trees:** Standard Merkle trees for aggregating transaction IDs within each block (`MerkleRoot`).
-*   **Approximate Membership Queries (AMQ):** Bloom Filters integrated into blocks (`block.BloomFilter`) to allow fast, probabilistic checking of transaction inclusion (part of Ticket 2).
-*   **Hybrid PoW/dBFT Consensus (Simulated Phase 4 -> Concrete Phase 6):**
-    *   **PoW for Proposal:** Blocks are proposed by nodes after solving a PoW puzzle (`ProofOfWork`, `ProposeBlock`). Block headers include `ProposerID`.
-    *   **dBFT for Finalization (Ticket 7 - Phase 6):**
-        *   Simulated Delegated Byzantine Fault Tolerance mechanism finalizes proposed blocks.
-        *   *Uses simulated ECDSA signatures for voting and verification.*
-        *   Requires > threshold of total reputation from eligible validators (`calculateAdaptiveThreshold`).
-        *   Finalized blocks store agreeing validator IDs (`FinalitySignatures`).
-        *   *Placeholder for VRF-based delegate selection exists (`SelectDelegateWithVRF`).*
+    *   **Pending:** Concrete 2PC protocol for cross-shard transactions.
+*   **Hybrid PoW/dBFT Consensus (Ticket 7 - Phase 6):**
+    *   Simulated Delegated Byzantine Fault Tolerance mechanism finalizes proposed blocks.
+    *   *Uses simulated ECDSA signatures for voting and verification.*
+    *   Requires > threshold of total reputation from eligible validators (`calculateAdaptiveThreshold`).
+    *   Finalized blocks store agreeing validator IDs (`FinalitySignatures`).
+    *   **Pending:** Full VRF integration for proposer selection.
 *   **Reputation System & Adaptive Threshold (Ticket 6 - Phase 4 & 6):**
     *   Validators maintain reputation scores (`Validator.Reputation`).
     *   Scores are updated based on consensus participation (rewards/penalties) handled by `ValidatorManager`.
-    *   *Consensus threshold (`calculateAdaptiveThreshold`) is now adaptive based on the total reputation of eligible validators.*
+    *   **Pending:** Advanced adversarial defenses (e.g., ZKPs/MPC, refined slashing conditions).
 *   **Node Authentication (Ticket 8 - Phase 4 & 6):**
     *   Nodes have an authentication status (`Node.IsAuthenticated`).
     *   Consensus eligibility checks consider this status (`GetActiveValidatorsForShard`).
-    *   *Implemented simulated challenge-response mechanism (`ChallengeValidator`, `VerifyResponse`) triggered periodically in `main.go` to update authentication status.*
-*   **Node/Validator Structures:**
-    *   `Node`: Represents network participants with ID, ECDSA Keys, authentication status/nonce. Includes `SignData` and `VerifySignature` methods.
-    *   `Validator`: Extends `Node` with reputation score and active status.
-    *   `ValidatorManager`: Manages validators, reputation, dBFT execution, and authentication challenges.
-*   **Adaptive Consistency & Conflict Resolution (Phase 5 - Ticket 4 & 5):**
-    *   Basic adaptive consistency model (`ConsistencyManager`).
-    *   Vector Clocks integrated into `StateDB` for causal tracking.
-    *   Entropy calculation function (`CalculateStateEntropy`) for conflict detection (integration pending).
-    *   Simulated VRF-based conflict resolution (`ResolveConflictVRF`) integrated into state updates.
-*   **Basic State Pruning (Ticket 10 - Phase 6):** Refined placeholder function (`PruneChain`) to keep a minimum number of recent blocks.
-*   **Simple Accumulator (Ticket 2 & 9 - Phase 6):** Implemented a basic hash-chain accumulator in `BlockHeader` with placeholder `UpdateAccumulator`, `GenerateProof`, `VerifyProof` methods.
-*   **Comprehensive Unit Tests:** Tests covering core data structures and functionalities (Blocks, Transactions, Merkle Trees, Blockchain, Sharding, State, Consensus, Consistency).
+    *   Implemented simulated challenge-response mechanism (`ChallengeValidator`, `VerifyResponse`) triggered periodically in `main.go` to update authentication status.
+    *   **Pending:** Continuous attestation and adaptive trust scoring based on behavior.
+*   **Simple Accumulator (Ticket 2 & 9 - Phase 6):**
+    *   Implemented a basic hash-chain accumulator in `BlockHeader` with placeholder `UpdateAccumulator`, `GenerateProof`, `VerifyProof` methods.
+    *   **Pending:** Advanced cryptographic accumulators (e.g., RSA) and proof compression.
+*   **Basic State Pruning (Ticket 10 - Phase 6):**
+    *   Refined placeholder function (`PruneChain`) to keep a minimum number of recent blocks.
+    *   **Pending:** Functional state archival to persistent/distributed storage.
 
 ### Planned / Future Work (Phase 6+ / Phase 7)
 
-*   **Full VRF Integration (Ticket 7):** Replace PoW or augment proposer selection with actual VRF implementation and verification.
-*   **Advanced Accumulators/Proofs (Ticket 2 & 9):** Implement more robust cryptographic accumulators (e.g., RSA) and corresponding efficient proofs. Explore proof compression.
-*   **Enhanced Cross-Shard Atomicity (Ticket 3):** Implement a concrete 2PC protocol for cross-shard transactions.
-*   **Advanced Adversarial Defense (Ticket 6):** Integrate ZKPs/MPC (long term), refine slashing conditions based on reputation and authentication failures.
-*   **Advanced Authentication (Ticket 8):** Implement continuous attestation, adaptive trust scoring based on behavior.
-*   **Functional State Archival (Ticket 10):** Implement archival of pruned blocks/state to persistent/distributed storage. Explore sparse Merkle trees or other compact state representations.
-*   **Advanced Testing Framework (Ticket 11):** Simulating complex network conditions (partitions, high churn), Byzantine attacks (equivocation, collusion), and performance benchmarking under load. *(Phase 7)*
-*   **Full Documentation (Ticket 12):** Comprehensive technical documentation, protocol specifications, API references, and security/performance analysis reports. *(Phase 7)*
+*   **Full VRF Integration (Ticket 7):** Replace PoW or augment proposer selection with actual VRF implementation and verification. **Pending**
+*   **Advanced Accumulators/Proofs (Ticket 2 & 9):** Implement more robust cryptographic accumulators (e.g., RSA) and corresponding efficient proofs. Explore proof compression. **Pending**
+*   **Enhanced Cross-Shard Atomicity (Ticket 3):** Implement a concrete 2PC protocol for cross-shard transactions. **Pending**
+*   **Advanced Adversarial Defense (Ticket 6):** Integrate ZKPs/MPC (long term), refine slashing conditions based on reputation and authentication failures. **Pending**
+*   **Advanced Authentication (Ticket 8):** Implement continuous attestation, adaptive trust scoring based on behavior. **Pending**
+*   **Functional State Archival (Ticket 10):** Implement archival of pruned blocks/state to persistent/distributed storage. Explore sparse Merkle trees or other compact state representations. **Pending**
+*   **Advanced Testing Framework (Ticket 11):** Simulating complex network conditions (partitions, high churn), Byzantine attacks (equivocation, collusion), and performance benchmarking under load. *(Phase 7)* **Pending**
+*   **Full Documentation (Ticket 12):** Comprehensive technical documentation, protocol specifications, API references, and security/performance analysis reports. *(Phase 7)* **Pending**
 
 ## Architecture Overview
 
@@ -129,7 +114,15 @@ The system is built around a `core` package containing the essential blockchain 
     *   ✅ Refined state pruning placeholder (Ticket 10).
     *   ✅ Added comments/placeholders for enhanced cross-shard sync (Ticket 3).
     *   ✅ Implemented adaptive consensus thresholds based on reputation (Ticket 6).
-*   The core simulation incorporates several Phase 6 features, enhancing realism and security aspects.
+    *   ⏳ Implement full VRF integration (Ticket 7).
+    *   ⏳ Implement advanced accumulators/proofs (Tickets 2, 9).
+    *   ⏳ Implement concrete 2PC for cross-shard TXs (Ticket 3).
+    *   ⏳ Implement advanced adversarial defenses (slashing, etc.) (Ticket 6).
+    *   ⏳ Implement advanced authentication (attestation, trust scoring) (Ticket 8).
+    *   ⏳ Implement functional state archival (Ticket 10).
+*   ◻️ **Phase 7:** Testing and Documentation (Tickets 11, 12)
+    *   Develop comprehensive integration and simulation tests (Byzantine scenarios, partitions).
+    *   Write detailed technical documentation and analysis reports.
 
 ## Roadmap (Based on Implementation Plan)
 

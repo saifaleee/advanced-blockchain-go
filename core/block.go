@@ -2,15 +2,58 @@ package core
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/gob"
 	"fmt"
 	"log"
 	"math/big"
 	"time"
-
-	"github.com/willf/bloom" // Import Bloom filter
+	// Import Bloom filter
 )
+
+// Accumulator represents an RSA-based cryptographic accumulator.
+type Accumulator struct {
+	N *big.Int // RSA modulus
+	V *big.Int // Accumulated value
+}
+
+// NewAccumulator initializes a new RSA-based accumulator.
+func NewAccumulator(bits int) (*Accumulator, error) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate RSA key: %w", err)
+	}
+	return &Accumulator{
+		N: privateKey.N,
+		V: big.NewInt(1), // Start with the identity element
+	}, nil
+}
+
+// Add adds an element to the accumulator.
+func (a *Accumulator) Add(element []byte) error {
+	elementHash := sha256.Sum256(element)
+	elementInt := new(big.Int).SetBytes(elementHash[:])
+	a.V.Exp(a.V, elementInt, a.N) // V = V^element mod N
+	return nil
+}
+
+// GenerateProof generates a proof of inclusion for an element.
+func (a *Accumulator) GenerateProof(element []byte) (*big.Int, error) {
+	elementHash := sha256.Sum256(element)
+	elementInt := new(big.Int).SetBytes(elementHash[:])
+	proof := new(big.Int).Exp(a.V, elementInt, a.N) // Proof = V^element mod N
+	return proof, nil
+}
+
+// VerifyProof verifies a proof of inclusion for an element.
+func (a *Accumulator) VerifyProof(element []byte, proof *big.Int) bool {
+	elementHash := sha256.Sum256(element)
+	elementInt := new(big.Int).SetBytes(elementHash[:])
+	expected := new(big.Int).Exp(proof, elementInt, a.N) // Expected = Proof^element mod N
+	return expected.Cmp(a.V) == 0
+}
 
 // BlockHeader represents the header part of a block.
 type BlockHeader struct {
@@ -35,6 +78,37 @@ type BlockHeader struct {
 	// --- Placeholders for Advanced Features (Phase 6 - Tickets 2, 9) ---
 	AccumulatorState []byte // Placeholder for cryptographic accumulator state (e.g., RSA accumulator)
 	ProofMetadata    []byte // Placeholder for metadata related to advanced/compressed proofs
+
+	Accumulator *Accumulator // Add accumulator to the block header
+}
+
+// UpdateAccumulator updates the block's accumulator with new data.
+func (bh *BlockHeader) UpdateAccumulator(data [][]byte) error {
+	if bh.Accumulator == nil {
+		return fmt.Errorf("accumulator not initialized")
+	}
+	for _, item := range data {
+		if err := bh.Accumulator.Add(item); err != nil {
+			return fmt.Errorf("failed to add item to accumulator: %w", err)
+		}
+	}
+	return nil
+}
+
+// GenerateProof generates a proof of inclusion for a specific data item.
+func (bh *BlockHeader) GenerateProof(data []byte) (*big.Int, error) {
+	if bh.Accumulator == nil {
+		return nil, fmt.Errorf("accumulator not initialized")
+	}
+	return bh.Accumulator.GenerateProof(data)
+}
+
+// VerifyProof verifies a proof of inclusion for a specific data item.
+func (bh *BlockHeader) VerifyProof(data []byte, proof *big.Int) bool {
+	if bh.Accumulator == nil {
+		return false
+	}
+	return bh.Accumulator.VerifyProof(data, proof)
 }
 
 // Block represents a block in the blockchain.
@@ -155,100 +229,6 @@ func (pow *ProofOfWork) Validate() bool {
 	return isValidTarget && isMatchingHash
 }
 
-// ProposeBlock creates a new block proposal via PoW, but doesn't finalize it.
-// It performs PoW and sets the Nonce and Hash.
-// Now also calculates and sets the block's VectorClock.
-func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []byte, height uint64, stateRoot []byte, difficulty int, proposerID NodeID, prevBlockVC VectorClock) (*Block, error) {
-	if proposerID == "" {
-		return nil, fmt.Errorf("proposer ID cannot be empty")
-	}
-
-	header := &BlockHeader{
-		ShardID:       shardID,
-		Timestamp:     time.Now().UnixNano(),
-		PrevBlockHash: prevBlockHash,
-		Height:        height,
-		Difficulty:    difficulty,
-		StateRoot:     stateRoot,
-		ProposerID:    proposerID,
-	}
-
-	block := &Block{
-		Header:       header,
-		Transactions: transactions,
-	}
-
-	// Calculate the block's vector clock.
-	// Start by copying the previous block's vector clock.
-	blockVC := prevBlockVC.Copy()
-	// The original code attempted to merge vector clocks from transactions,
-	// but the Transaction type doesn't have a VectorClock field.
-	// Removing this loop as transactions don't carry vector clocks in the current definition.
-	// for _, tx := range transactions {
-	// 	blockVC.Merge(tx.VectorClock) // This line caused the compile error
-	// }
-	// Increment the clock for the current shard where the block is being proposed.
-	blockVC[shardID]++
-	block.Header.VectorClock = blockVC
-
-	txHashes := make([][]byte, len(transactions))
-	for i, tx := range transactions {
-		txHashes[i] = tx.ID // Replace tx.Hash() with tx.ID
-	}
-	merkleTree, err := NewMerkleTree(txHashes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Merkle tree: %w", err)
-	}
-	block.Header.MerkleRoot = merkleTree.GetMerkleRoot()
-
-	// Correct Bloom filter estimation
-	n := uint(len(transactions))
-	if n == 0 {
-		n = 1 // Avoid creating a filter with 0 items if there are no transactions
-	}
-	p := 0.01 // Standard false positive rate
-	filter := bloom.NewWithEstimates(n, p)
-	for _, tx := range transactions {
-		filter.Add(tx.ID) // Replace tx.Hash() with tx.ID
-	}
-	var buf bytes.Buffer
-	_, err = filter.WriteTo(&buf)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize bloom filter: %w", err)
-	}
-	block.Header.BloomFilter = buf.Bytes()
-
-	// Initialize Accumulator state for the new block (e.g., from previous block or empty)
-	// For simplicity, let's assume it starts empty or inherits. Here, start empty.
-	block.Header.AccumulatorState = []byte("genesis_accumulator_state") // Or fetch from prev block header
-	// Update accumulator with transactions in this block
-	txDataForAccumulator := make([][]byte, len(transactions))
-	for i, tx := range transactions {
-		txDataForAccumulator[i] = tx.ID // Replace tx.Hash() with tx.ID
-	}
-	err = block.Header.UpdateAccumulator(txDataForAccumulator)
-	if err != nil {
-		log.Printf("Warning: Failed to update accumulator during block proposal: %v", err)
-		// Decide if this is critical. For PoC, maybe just log.
-	}
-
-	pow := NewProofOfWork(block)
-	nonce, hash := pow.Run()
-
-	var hashInt big.Int
-	hashInt.SetBytes(hash)
-	if hashInt.Cmp(pow.target) != -1 {
-		return nil, fmt.Errorf("proof of work failed for shard %d (max nonce reached or other issue)", shardID)
-	}
-
-	block.Header.Nonce = nonce
-	block.Hash = hash
-
-	log.Printf("Shard %d: Proposed Block H:%d by %s. Hash: %x... VC: %v", shardID, height, proposerID, safeSlice(hash, 4), block.Header.VectorClock)
-
-	return block, nil
-}
-
 // FinalizeBlock sets the finality signatures on a block header.
 func (b *Block) Finalize(finalizingValidators []NodeID) {
 	b.Header.FinalitySignatures = finalizingValidators
@@ -365,8 +345,8 @@ func (b *Block) GetTransactionMerkleProof(txID []byte) ([][]byte, uint64, error)
 
 // Enhanced cryptographic accumulator implementation using Merkle trees
 
-// Refine UpdateAccumulator to ensure consistent accumulator updates
-func (bh *BlockHeader) UpdateAccumulator(newData [][]byte) error {
+// UpdateAccumulator updates the cryptographic accumulator with new data.
+func (bh *BlockHeader) UpdateAccumulatorLegacy(newData [][]byte) error {
 	if len(newData) == 0 {
 		return fmt.Errorf("no data provided for accumulator update")
 	}
@@ -374,14 +354,14 @@ func (bh *BlockHeader) UpdateAccumulator(newData [][]byte) error {
 	// Build a Merkle tree from the new data
 	merkleTree, err := NewMerkleTree(newData)
 	if err != nil {
-		return fmt.Errorf("failed to update accumulator: %w", err)
+		return fmt.Errorf("failed to build Merkle tree for accumulator: %w", err)
 	}
 	bh.AccumulatorState = merkleTree.GetMerkleRoot()
 	return nil
 }
 
-// GenerateProof generates a Merkle proof for a specific data item.
-func (bh *BlockHeader) GenerateProof(data []byte) ([]byte, error) {
+// GenerateProof generates a cryptographic proof for a specific data item.
+func (bh *BlockHeader) GenerateProofLegacy(data []byte) ([]byte, error) {
 	merkleTree := NewMerkleTreeFromRoot(bh.AccumulatorState)
 	proof, err := merkleTree.GenerateProof(data)
 	if err != nil {
@@ -390,8 +370,8 @@ func (bh *BlockHeader) GenerateProof(data []byte) ([]byte, error) {
 	return proof, nil
 }
 
-// VerifyProof verifies a Merkle proof for a specific data item.
-func (bh *BlockHeader) VerifyProof(data []byte, proof []byte) bool {
+// VerifyProof verifies a cryptographic proof for a specific data item.
+func (bh *BlockHeader) VerifyProofLegacy(data []byte, proof []byte) bool {
 	merkleTree := NewMerkleTreeFromRoot(bh.AccumulatorState)
 	return merkleTree.VerifyProof(data, proof)
 }
