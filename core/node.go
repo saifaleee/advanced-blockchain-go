@@ -19,6 +19,7 @@ type Node struct {
 	Authentication *NodeAuthentication // Changed to pointer for atomic updates
 	TrustScore     float64             // Adaptive trust score
 	LastAttested   time.Time           // Timestamp of last successful attestation/challenge response
+	VRF            *SecureVRF          // Add VRF instance for the node
 }
 
 // NodeAuthentication holds authentication-related state for a node.
@@ -28,19 +29,29 @@ type NodeAuthentication struct {
 	AuthNonce       atomic.Uint64 // Use atomic.Uint64 for nonce
 }
 
-// NewNode creates a new Node with ECDSA keys.
+// NewNode creates a new Node with ECDSA keys and initializes its VRF instance.
 // Returns Node and error.
 func NewNode(id NodeID) (*Node, error) {
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate ECDSA key for node %s: %w", id, err)
 	}
+	publicKey := &privateKey.PublicKey // Get public key from private key
+
+	// --- FIX: Pass Node's keys to NewSecureVRF ---
+	vrf, err := NewSecureVRF(privateKey, publicKey) // Use the node's keys
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize VRF for node %s: %w", id, err)
+	}
+	// --- END FIX ---
+
 	node := &Node{
 		ID:             id,
-		PrivateKey:     privateKey,
-		PublicKey:      &privateKey.PublicKey,
+		PrivateKey:     privateKey,            // Store the private key
+		PublicKey:      publicKey,             // Store the public key
 		Authentication: &NodeAuthentication{}, // Initialize authentication struct
 		TrustScore:     0.5,                   // Initial neutral trust score
+		VRF:            vrf,                   // Assign VRF instance using the node's keys
 	}
 	// Initialize atomic values
 	node.Authentication.IsAuthenticated.Store(false) // Start as not authenticated
@@ -48,6 +59,7 @@ func NewNode(id NodeID) (*Node, error) {
 	return node, nil
 }
 
+// ... (rest of node.go remains the same)
 // SignData signs arbitrary data using the node's private key.
 // Assumes the input data is the hash that needs to be signed.
 func (n *Node) SignData(dataHash []byte) ([]byte, error) {

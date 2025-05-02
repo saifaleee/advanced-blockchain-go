@@ -236,63 +236,43 @@ func (b *Block) Finalize(finalizingValidators []NodeID) {
 		b.Header.ShardID, b.Header.Height, safeSlice(b.Hash, 4), len(finalizingValidators))
 }
 
-// NewGenesisBlock creates the first block for a specific shard.
+// NewGenesisBlock creates the first block (Height 0) for a specific shard.
 func NewGenesisBlock(shardID uint64, coinbase *Transaction, difficulty int, genesisProposerID NodeID) *Block {
 	if coinbase == nil {
+		// Create a default coinbase if none provided
 		coinbase = NewTransaction(IntraShardTx, []byte(fmt.Sprintf("Genesis Block Coinbase Shard %d", shardID)), uint32(shardID), uint32(shardID))
 	}
-	emptyStateRoot := []byte{}
+	emptyStateRoot := EmptyMerkleRoot() // Use deterministic empty root
 
-	genesisVC := make(VectorClock)
-	genesisVC[shardID] = 1
+	// --- FIX: Initialize genesisVC correctly ---
+	genesisVC := make(VectorClock) // Create the VC for this genesis block
+	genesisVC[shardID] = 1         // Initialize its own entry
+	// --- END FIX ---
 
 	genesisProposer := genesisProposerID
 	if genesisProposer == "" {
-		genesisProposer = "GENESIS"
+		genesisProposer = "GENESIS" // Default proposer ID if empty
 	}
 
-	block, err := ProposeBlock(shardID, []*Transaction{coinbase}, []byte{}, 0, emptyStateRoot, difficulty, genesisProposer, make(VectorClock))
+	// --- FIX: Pass genesisVC to ProposeBlock ---
+	block, err := ProposeBlock(shardID, []*Transaction{coinbase}, []byte{}, 0, emptyStateRoot, difficulty, genesisProposer, genesisVC) // Pass height 0 and genesisVC
+	// --- END FIX ---
 
 	if err != nil {
-		log.Printf("Warning: ProposeBlock failed for Genesis Shard %d: %v. Creating minimal Genesis.", shardID, err)
-		header := &BlockHeader{
-			ShardID:            shardID,
-			Timestamp:          time.Now().UnixNano(),
-			PrevBlockHash:      []byte{},
-			MerkleRoot:         []byte{},
-			StateRoot:          emptyStateRoot,
-			Nonce:              0,
-			Height:             0,
-			Difficulty:         difficulty,
-			BloomFilter:        []byte{},
-			ProposerID:         genesisProposer,
-			FinalitySignatures: []NodeID{"GENESIS"},
-			VectorClock:        genesisVC,
-		}
-		block = &Block{
-			Header:       header,
-			Transactions: []*Transaction{coinbase},
-			Hash:         []byte("genesis_fallback_hash"),
-		}
-		if len(block.Transactions) > 0 {
-			tree, err := NewMerkleTree([][]byte{block.Transactions[0].ID}) // Replace `Hash()` with `ID`
-			if err != nil {
-				log.Printf("Warning: Failed to create Merkle tree for single transaction: %v", err)
-				return nil
-			}
-			if tree != nil {
-				block.Header.MerkleRoot = tree.GetMerkleRoot()
-			}
-		}
-		pow := NewProofOfWork(block)
-		block.Hash = pow.PrepareData(0)
-
-	} else {
-		block.Finalize([]NodeID{genesisProposer})
-		block.Header.VectorClock = genesisVC
+		// This path indicates ProposeBlock failed (e.g., invalid TX, PoW failure)
+		log.Printf("CRITICAL: ProposeBlock failed during Genesis creation for Shard %d: %v. Returning nil.", shardID, err)
+		// Return nil as genesis creation failed critically
+		return nil
 	}
 
-	log.Printf("Created Genesis Block for Shard %d. Hash: %x... VC: %v", shardID, safeSlice(block.Hash, 4), block.Header.VectorClock)
+	// Genesis block is considered finalized by default (by itself)
+	block.Finalize([]NodeID{genesisProposer})
+
+	// --- FIX: Remove redundant VC assignment ---
+	// block.Header.VectorClock = genesisVC // VC is now set correctly inside ProposeBlock
+	// --- END FIX ---
+
+	log.Printf("Created Genesis Block for Shard %d. Hash: %x... H: %d VC: %v", shardID, safeSlice(block.Hash, 4), block.Header.Height, block.Header.VectorClock)
 	return block
 }
 

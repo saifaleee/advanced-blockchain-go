@@ -340,58 +340,132 @@ func (vm *ValidatorManager) CalculateAdaptiveThreshold(eligibleValidators []*Val
 	return threshold
 }
 
-// SelectDelegateWithVRF selects a delegate using a Verifiable Random Function (placeholder).
-// Uses a combination of a seed (e.g., prev block hash) and shard ID for input.
-func (vm *ValidatorManager) SelectDelegateWithVRF(seed []byte, shardID uint64, blockHeight uint64) (*Validator, error) { // Added blockHeight
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
-
+// SelectDelegateWithVRF selects a delegate using a Verifiable Random Function (VRF) for consensus.
+// It iterates through eligible validators, evaluates their VRF, verifies the proof, and selects the one with the lowest valid output.
+func (vm *ValidatorManager) SelectDelegateWithVRF(seed []byte, shardID uint64, blockHeight uint64) (*Validator, *VRFOutput, error) { // Return proof as well
+	vm.mu.RLock() // Use RLock as we are primarily reading validator data
 	eligible := vm.GetActiveValidatorsForShard(shardID)
+	vm.mu.RUnlock() // Release lock after getting the list
+
 	if len(eligible) == 0 {
-		return nil, fmt.Errorf("no eligible validators for VRF selection on shard %d", shardID)
+		return nil, nil, fmt.Errorf("no eligible validators for VRF selection on shard %d", shardID)
 	}
 
 	var bestValidator *Validator
 	var lowestValue *big.Int
+	var bestProof *VRFOutput // Store the proof of the best validator
 
-	log.Printf("[Consensus] Simulating VRF Delegate Selection for Shard %d (H:%d) with %d candidates.", shardID, blockHeight, len(eligible))
+	// log.Printf("[Consensus] Starting VRF Delegate Selection for Shard %d (H:%d) with %d candidates. Seed: %x", shardID, blockHeight, len(eligible), seed)
 
-	// Create a more deterministic base input for this selection round
+	// Construct the base input for VRF evaluation (consistent across validators)
 	baseInput := bytes.Join(
 		[][]byte{
-			seed, // e.g., previous block hash
+			seed,
 			[]byte(fmt.Sprintf("%d", shardID)),
-			[]byte(fmt.Sprintf("%d", blockHeight)), // Include height
+			[]byte(fmt.Sprintf("%d", blockHeight)),
 		},
 		[]byte{},
 	)
 
+	var selectionWg sync.WaitGroup
+	resultChan := make(chan struct {
+		validator *Validator
+		proof     *VRFOutput
+		value     *big.Int
+		err       error
+	}, len(eligible)) // Buffered channel
+
+	// Evaluate VRF for each eligible validator concurrently
 	for _, v := range eligible {
-		// Combine base input with validator-specific info
-		vrfInput := append(append([]byte{}, baseInput...), []byte(v.Node.ID)...)
-		hash := sha256.Sum256(vrfInput)
-		value := new(big.Int).SetBytes(hash[:])
+		selectionWg.Add(1)
+		go func(validator *Validator) {
+			defer selectionWg.Done()
 
-		// In a real VRF, we'd verify the proof here.
-		// We assume the simulated generation is always valid for the placeholder.
-		isValidProof := true
-
-		if isValidProof {
-			if lowestValue == nil || value.Cmp(lowestValue) < 0 {
-				lowestValue = value
-				bestValidator = v
+			if validator.Node == nil || validator.Node.VRF == nil {
+				// log.Printf("[Consensus] Validator %s has missing Node or VRF instance.", validator.Node.ID)
+				resultChan <- struct {
+					validator *Validator
+					proof     *VRFOutput
+					value     *big.Int
+					err       error
+				}{validator, nil, nil, fmt.Errorf("missing node or vrf")}
+				return
 			}
+
+			// Append validator ID to base input for unique evaluation
+			vrfInput := append(baseInput, []byte(validator.Node.ID)...)
+			// log.Printf("[Consensus] Evaluating VRF for Validator %s with input: %x", validator.Node.ID, vrfInput)
+
+			// Evaluate VRF using the validator's specific VRF instance
+			output, err := validator.Node.VRF.Evaluate(vrfInput)
+			if err != nil {
+				// log.Printf("[Consensus] VRF evaluation failed for Validator %s: %v", validator.Node.ID, err)
+				resultChan <- struct {
+					validator *Validator
+					proof     *VRFOutput
+					value     *big.Int
+					err       error
+				}{validator, nil, nil, fmt.Errorf("evaluation failed: %w", err)}
+				return
+			}
+
+			// Verify the proof using the validator's public key right away
+			if !VerifyWithPublicKey(validator.Node.PublicKey, vrfInput, output) {
+				// log.Printf("[Consensus] VRF proof verification failed for Validator %s", validator.Node.ID)
+				// Optionally penalize the validator here (needs mutex if modifying reputation)
+				// go vm.UpdateReputation(validator.Node.ID, -1) // Example concurrent penalty
+				resultChan <- struct {
+					validator *Validator
+					proof     *VRFOutput
+					value     *big.Int
+					err       error
+				}{validator, output, nil, fmt.Errorf("verification failed")}
+				return
+			}
+
+			// If evaluation and verification succeeded, send result
+			value := new(big.Int).SetBytes(output.Output)
+			// log.Printf("[Consensus] Validator %s VRF output value: %s", validator.Node.ID, value.String())
+			resultChan <- struct {
+				validator *Validator
+				proof     *VRFOutput
+				value     *big.Int
+				err       error
+			}{validator, output, value, nil}
+
+		}(v)
+	}
+
+	// Wait for all evaluations to complete and close channel
+	go func() {
+		selectionWg.Wait()
+		close(resultChan)
+	}()
+
+	// Process results from the channel
+	validResults := 0
+	for result := range resultChan {
+		if result.err == nil && result.value != nil {
+			validResults++
+			if lowestValue == nil || result.value.Cmp(lowestValue) < 0 {
+				lowestValue = result.value
+				bestValidator = result.validator
+				bestProof = result.proof // Store the corresponding proof
+			}
+		} else {
+			// Log the error for the specific validator if needed
+			// log.Printf("[Consensus] VRF issue for validator %s: %v", result.validator.Node.ID, result.err)
 		}
 	}
 
 	if bestValidator == nil {
-		// This should ideally not happen if there are eligible validators, but handle defensively.
-		log.Printf("[Consensus] VRF selection failed unexpectedly for shard %d (H:%d), falling back to random.", shardID, blockHeight)
-		return eligible[vm.randSource.Intn(len(eligible))], nil
+		log.Printf("[Consensus] No valid VRF delegate found after evaluating %d candidates for shard %d (H:%d). Valid results: %d.", len(eligible), shardID, blockHeight, validResults)
+		return nil, nil, fmt.Errorf("no valid delegate found for shard %d (H:%d)", shardID, blockHeight)
 	}
 
-	log.Printf("[Consensus] VRF selected Validator %s for Shard %d (H:%d) (Value: %s...)", bestValidator.Node.ID, shardID, blockHeight, lowestValue.String()[:10])
-	return bestValidator, nil
+	log.Printf("[Consensus] VRF selected Validator %s for Shard %d (H:%d)", bestValidator.Node.ID, shardID, blockHeight)
+	// Return the best validator AND their corresponding proof
+	return bestValidator, bestProof, nil
 }
 
 // --- Challenge-Response (Ticket 8) --- //
