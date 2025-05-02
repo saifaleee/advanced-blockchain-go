@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"sync/atomic"
 	"time"
 )
@@ -119,6 +120,22 @@ func (n *Node) RewardTrustScore(amount float64) {
 		n.TrustScore = 1.0
 	}
 	fmt.Printf("[Trust] Node %s trust score rewarded by %.2f. New trust score: %.2f\n", n.ID, amount, n.TrustScore)
+}
+
+// Add adaptive trust scoring logic to Node
+func (n *Node) AdjustTrustScoreBasedOnBehavior(positive bool) {
+	if positive {
+		n.TrustScore += 0.1
+		if n.TrustScore > 1.0 {
+			n.TrustScore = 1.0
+		}
+	} else {
+		n.TrustScore -= 0.2
+		if n.TrustScore < 0.0 {
+			n.TrustScore = 0.0
+		}
+	}
+	log.Printf("[Trust] Node %s trust score adjusted to %.2f", n.ID, n.TrustScore)
 }
 
 // Attest performs a challenge-response attestation for the node.

@@ -150,6 +150,25 @@ func (db *InMemoryStateDB) ArchiveState(filePath string) error {
 	return nil
 }
 
+// Add a method to archive state to persistent storage
+func (db *InMemoryStateDB) ArchiveStateToPersistentStorage(filePath string) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	data, err := json.MarshalIndent(db.data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to serialize state: %w", err)
+	}
+
+	err = os.WriteFile(filePath, data, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write state to persistent storage: %w", err)
+	}
+
+	log.Printf("[Archive] State successfully archived to persistent storage at %s", filePath)
+	return nil
+}
+
 // RestoreState loads the state from a specified file path.
 func (db *InMemoryStateDB) RestoreState(filePath string) error {
 	db.mu.Lock()

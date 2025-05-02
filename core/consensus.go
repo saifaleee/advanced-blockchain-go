@@ -472,6 +472,23 @@ func (vm *ValidatorManager) MonitorAdversarialBehavior() {
 	}
 }
 
+// Add advanced adversarial defense logic to ValidatorManager
+func (vm *ValidatorManager) MonitorAdvancedAdversarialBehavior() {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+
+	for _, validator := range vm.Validators {
+		if validator.Reputation.Load() < 10 && validator.IsActive.Load() {
+			log.Printf("[Adversarial] Validator %s flagged for adversarial behavior.", validator.Node.ID)
+			vm.SlashValidator(validator.Node.ID, "Low reputation indicating adversarial behavior")
+		}
+		if validator.Node.TrustScore < 0.3 {
+			log.Printf("[Adversarial] Validator %s has low trust score.", validator.Node.ID)
+			vm.SlashValidator(validator.Node.ID, "Low trust score indicating adversarial behavior")
+		}
+	}
+}
+
 // VerifyAndSlash checks a validator's behavior during consensus and applies slashing if necessary.
 func (vm *ValidatorManager) VerifyAndSlash(nodeID NodeID, isValid bool, reason string) {
 	if !isValid {

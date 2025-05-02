@@ -142,6 +142,15 @@ func (v *SecureVRF) SelectDelegateWithVRF(seed []byte, validators []*Validator) 
 	return bestValidator, nil
 }
 
+// IntegrateVRFIntoConsensus integrates VRF into the consensus process.
+func (v *SecureVRF) IntegrateVRFIntoConsensus(seed []byte, validators []*Validator) (*Validator, *VRFOutput, error) {
+	validator, proof, err := v.SelectProposerWithProof(validators, seed)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to integrate VRF into consensus: %w", err)
+	}
+	return validator, proof, nil
+}
+
 // equal compares two byte slices for equality.
 func equal(a, b []byte) bool {
 	if len(a) != len(b) {
@@ -175,4 +184,16 @@ func SortNodeIDs(nodeIDs []NodeID) {
 	sort.Slice(nodeIDs, func(i, j int) bool {
 		return nodeIDs[i] < nodeIDs[j]
 	})
+}
+
+// GenerateAccumulatorProof generates a proof for a validator's participation.
+func GenerateAccumulatorProof(validator *Validator, seed []byte) ([]byte, error) {
+	hash := sha256.Sum256(append(seed, []byte(validator.Node.ID)...))
+	return hash[:], nil
+}
+
+// VerifyAccumulatorProof verifies the proof for a validator's participation.
+func VerifyAccumulatorProof(validator *Validator, seed []byte, proof []byte) bool {
+	expectedHash := sha256.Sum256(append(seed, []byte(validator.Node.ID)...))
+	return bytes.Equal(expectedHash[:], proof)
 }
