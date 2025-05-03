@@ -1,17 +1,212 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/gorilla/mux"
+	"github.com/rs/cors"
 	"github.com/saifaleee/advanced-blockchain-go/core"
 )
+
+// API Response structures for JSON serialization
+type BlockchainResponse struct {
+	Shards        []ShardResponse `json:"shards"`
+	ValidatorInfo []ValidatorInfo `json:"validators"`
+	Metrics       MetricsResponse `json:"metrics"`
+}
+
+type ShardResponse struct {
+	ID         uint32      `json:"id"`
+	Blocks     []BlockInfo `json:"blocks"`
+	TxPoolSize int         `json:"txPoolSize"`
+	StateSize  int         `json:"stateSize"`
+}
+
+type BlockInfo struct {
+	Hash         string   `json:"hash"`
+	PrevHash     string   `json:"prevHash"`
+	Timestamp    int64    `json:"timestamp"`
+	Nonce        uint64   `json:"nonce"`
+	Transactions []TxInfo `json:"transactions"`
+	ShardID      uint32   `json:"shardId"`
+	Height       uint64   `json:"height"`
+}
+
+type TxInfo struct {
+	ID        string `json:"id"`
+	Type      int    `json:"type"`
+	Data      string `json:"data"`
+	FromShard uint32 `json:"fromShard"`
+	ToShard   uint32 `json:"toShard"`
+	Status    int    `json:"status"`
+}
+
+type ValidatorInfo struct {
+	ID         string `json:"id"`
+	Reputation int64  `json:"reputation"`
+	IsActive   bool   `json:"isActive"`
+}
+
+type MetricsResponse struct {
+	TotalBlocks        int `json:"totalBlocks"`
+	TotalTransactions  int `json:"totalTransactions"`
+	TotalCrossShardTxs int `json:"totalCrossShardTxs"`
+}
+
+// startAPIServer initializes and starts HTTP server for blockchain visualization
+func startAPIServer(bc *core.Blockchain) {
+	router := mux.NewRouter()
+
+	// Configure CORS to allow frontend access
+	c := cors.New(cors.Options{
+		AllowedOrigins: []string{"*"}, // Allow all origins in development
+		AllowedMethods: []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders: []string{"*"}, // Allow all headers
+		Debug:          true,          // Enable CORS debugging
+	})
+
+	// Endpoint to get blockchain data
+	router.HandleFunc("/api/blockchain", func(w http.ResponseWriter, r *http.Request) {
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Create response object
+		response := BlockchainResponse{
+			Shards:        make([]ShardResponse, 0),
+			ValidatorInfo: make([]ValidatorInfo, 0),
+			Metrics:       MetricsResponse{},
+		}
+
+		// Lock blockchain for reading
+		bc.ChainMu.RLock()
+		defer bc.ChainMu.RUnlock()
+
+		// Get shard information
+		shardIDs := bc.ShardManager.GetAllShardIDs()
+		totalBlocks := 0
+		totalTxs := 0
+		totalCrossTxs := 0
+
+		for _, shardID := range shardIDs {
+			if chain, exists := bc.BlockChains[shardID]; exists {
+				shardResp := ShardResponse{
+					ID:     uint32(shardID),
+					Blocks: make([]BlockInfo, 0),
+				}
+
+				// Get shard instance for txpool and state info
+				if shard, ok := bc.ShardManager.GetShard(shardID); ok {
+					shardResp.TxPoolSize = len(shard.TxPool)
+					stateSize := shard.StateDB.Size()
+					shardResp.StateSize = stateSize
+				}
+
+				// Get block information
+				for _, block := range chain {
+					blockInfo := BlockInfo{
+						Hash:         fmt.Sprintf("%x", block.Hash),
+						PrevHash:     fmt.Sprintf("%x", block.Header.PrevBlockHash),
+						Timestamp:    block.Header.Timestamp,
+						Nonce:        uint64(block.Header.Nonce),
+						ShardID:      uint32(block.Header.ShardID),
+						Height:       block.Header.Height,
+						Transactions: make([]TxInfo, 0),
+					}
+
+					// Add transaction information
+					for _, tx := range block.Transactions {
+						txInfo := TxInfo{
+							ID:        fmt.Sprintf("%x", tx.ID),
+							Type:      int(tx.Type),
+							Data:      string(tx.Data),
+							FromShard: tx.FromShard,
+							ToShard:   tx.ToShard,
+							Status:    0, // Default to 0 (pending) if no status available
+						}
+						// Convert string status to int if needed
+						if tx.Status == "Committed" {
+							txInfo.Status = 1 // Confirmed
+						} else if tx.Status == "Aborted" {
+							txInfo.Status = 2 // Failed
+						}
+
+						blockInfo.Transactions = append(blockInfo.Transactions, txInfo)
+
+						totalTxs++
+						if tx.FromShard != tx.ToShard {
+							totalCrossTxs++
+						}
+					}
+
+					shardResp.Blocks = append(shardResp.Blocks, blockInfo)
+					totalBlocks++
+				}
+
+				response.Shards = append(response.Shards, shardResp)
+			}
+		}
+
+		// Get validator information
+		validators := bc.ValidatorManager.GetAllValidators()
+		for _, validator := range validators {
+			valInfo := ValidatorInfo{
+				ID:         string(validator.Node.ID),
+				Reputation: validator.Reputation.Load(),
+				IsActive:   validator.IsActive.Load(),
+			}
+			response.ValidatorInfo = append(response.ValidatorInfo, valInfo)
+		}
+
+		// Set metrics
+		response.Metrics.TotalBlocks = totalBlocks
+		response.Metrics.TotalTransactions = totalTxs
+		response.Metrics.TotalCrossShardTxs = totalCrossTxs
+
+		// Return JSON response
+		json.NewEncoder(w).Encode(response)
+	})
+
+	// Endpoint to get telemetry data
+	router.HandleFunc("/api/telemetry", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		telemetryData := struct {
+			NetworkLatency  map[string]float64 `json:"networkLatency"`
+			ProcessingTimes map[string]float64 `json:"processingTimes"`
+			ResourceUsage   map[string]float64 `json:"resourceUsage"`
+			Timestamp       int64              `json:"timestamp"`
+		}{
+			NetworkLatency:  make(map[string]float64),
+			ProcessingTimes: make(map[string]float64),
+			ResourceUsage:   make(map[string]float64),
+			Timestamp:       time.Now().Unix(),
+		}
+
+		// Add sample telemetry data
+		telemetryData.NetworkLatency["avg_block_propagation"] = 50.5
+		telemetryData.ProcessingTimes["avg_block_validation"] = 12.8
+		telemetryData.ResourceUsage["memory_mb"] = 256.0
+
+		json.NewEncoder(w).Encode(telemetryData)
+	})
+
+	// Start the HTTP server
+	go func() {
+		log.Println("Starting API server on :8080...")
+		if err := http.ListenAndServe(":8080", c.Handler(router)); err != nil {
+			log.Printf("API server error: %v", err)
+		}
+	}()
+}
 
 // safeSlice helper (keep as is)
 func safeSlice(data []byte, n int) []byte {
@@ -20,6 +215,7 @@ func safeSlice(data []byte, n int) []byte {
 	}
 	return data[:n]
 }
+
 func main() {
 	log.Println("--- Advanced Go Blockchain PoC - Phase 6 Simulation ---") // Updated title
 	rand.Seed(time.Now().UnixNano())
@@ -28,7 +224,7 @@ func main() {
 	initialShards := 2
 	numValidators := 5 // Number of validators to simulate
 	initialReputation := int64(10)
-	simulationDuration := 2 * time.Minute // Run simulation for 2 minutes
+	simulationDuration := 5 * time.Minute // Extended simulation duration from 2 to 5 minutes
 	pruneKeepBlocks := 10                 // Keep the last 10 blocks when pruning
 	powDifficulty := 4                    // Example PoW difficulty
 
@@ -38,12 +234,12 @@ func main() {
 	smConfig.SplitThresholdTxPool = 20
 	smConfig.MergeThresholdStateSize = 5
 	smConfig.MergeTargetThresholdSize = 5
-	smConfig.CheckInterval = 15 * time.Second
-	smConfig.MaxShards = 4 // Keep max shards low for demo
+	smConfig.CheckInterval = 30 * time.Second // Increased from 15 to 30 seconds
+	smConfig.MaxShards = 4                    // Keep max shards low for demo
 
 	// Configuration for Telemetry and Consistency
-	telemetryInterval := 5 * time.Second
-	consistencyInterval := 10 * time.Second
+	telemetryInterval := 10 * time.Second   // Increased from 5 to 10 seconds
+	consistencyInterval := 20 * time.Second // Increased from 10 to 20 seconds
 	consistencyConfig := core.DefaultConsistencyConfig()
 
 	// Blockchain Config (Pass NumValidators and InitialReputation here)
@@ -77,6 +273,10 @@ func main() {
 	bc.ShardManager.SetBlockchainLink(bc)           // Link shard manager back to bc
 
 	log.Printf("Blockchain initialized with %d shards. Initial IDs: %v\n", initialShards, bc.ShardManager.GetAllShardIDs())
+
+	// --- Start API Server immediately ---
+	log.Println("Starting API server for frontend...")
+	startAPIServer(bc)
 
 	// --- FIX START: Assign localNode AFTER Blockchain init ---
 	var localNode *core.Node
@@ -169,10 +369,9 @@ func main() {
 	// Goroutine for generating transactions
 	wg.Add(1)
 	go func() {
-		// ... (rest of TX generator goroutine is unchanged)
 		defer wg.Done()
 		log.Println("[TX Generator] Starting...")
-		ticker := time.NewTicker(1 * time.Second)
+		ticker := time.NewTicker(3 * time.Second) // Increased from 1 to 3 seconds
 		defer ticker.Stop()
 		txCounter := 0
 
@@ -192,7 +391,7 @@ func main() {
 
 					if numActiveShards == 0 {
 						log.Println("[TX Generator] No active shards to send transactions to. Sleeping.")
-						time.Sleep(1 * time.Second) // Wait if no shards are available
+						time.Sleep(3 * time.Second) // Increased from 1 to 3 seconds wait
 						continue
 					}
 
@@ -222,7 +421,7 @@ func main() {
 						// log.Printf("[TX Generator] Added TX #%d (Type %d) to shard %d", txCounter, tx.Type, tx.ToShard)
 					}
 					// Add slight delay between sending transactions
-					time.Sleep(time.Duration(rand.Intn(30)+10) * time.Millisecond)
+					time.Sleep(time.Duration(rand.Intn(100)+50) * time.Millisecond) // Increased from (30+10) to (100+50)
 				}
 			}
 		}
@@ -231,10 +430,9 @@ func main() {
 	// Goroutine for triggering mining
 	wg.Add(1)
 	go func() {
-		// ... (rest of Miner goroutine is unchanged)
 		defer wg.Done()
 		log.Println("[Miner] Starting consensus loop...")
-		ticker := time.NewTicker(7 * time.Second) // Adjust mining interval if needed
+		ticker := time.NewTicker(15 * time.Second) // Increased from 7 to 15 seconds
 		defer ticker.Stop()
 
 		for {
@@ -255,7 +453,7 @@ func main() {
 					go func(sID uint64) {
 						defer roundWg.Done()
 						// Add slight random delay before attempting to mine
-						time.Sleep(time.Duration(rand.Intn(100)+10) * time.Millisecond)
+						time.Sleep(time.Duration(rand.Intn(500)+100) * time.Millisecond) // Increased from (100+10) to (500+100)
 
 						// Check if shard still exists (it might have been merged)
 						if _, exists := bc.ShardManager.GetShard(sID); !exists {
@@ -298,9 +496,8 @@ func main() {
 	// Goroutine to periodically print validator reputations
 	wg.Add(1)
 	go func() {
-		// ... (rest of Reputation printer goroutine is unchanged)
 		defer wg.Done()
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(60 * time.Second) // Increased from 30 to 60 seconds
 		defer ticker.Stop()
 		lastLevel := core.Strong // Assuming initial level is Strong
 
@@ -362,11 +559,10 @@ func main() {
 	// Goroutine for periodic authentication challenges
 	wg.Add(1)
 	go func() {
-		// ... (rest of Auth challenger goroutine is unchanged)
 		defer wg.Done()
 		// Initial delay before starting challenges
-		time.Sleep(20 * time.Second)
-		ticker := time.NewTicker(45 * time.Second) // Interval for challenge rounds
+		time.Sleep(30 * time.Second)               // Increased from 20 to 30 seconds
+		ticker := time.NewTicker(90 * time.Second) // Increased from 45 to 90 seconds
 		defer ticker.Stop()
 
 		for {
