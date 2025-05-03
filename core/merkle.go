@@ -104,6 +104,13 @@ func NewMerkleTree(data [][]byte) (*MerkleTree, error) {
 	return &tree, nil
 }
 
+// NewMerkleTreeFromRoot initializes a Merkle tree from a given root hash.
+func NewMerkleTreeFromRoot(rootHash []byte) *MerkleTree {
+	return &MerkleTree{
+		RootNode: &MerkleNode{Data: rootHash},
+	}
+}
+
 // GetMerkleRoot returns the root hash of the tree.
 func (t *MerkleTree) GetMerkleRoot() []byte {
 	if t == nil || t.RootNode == nil {
@@ -179,6 +186,28 @@ func (t *MerkleTree) GenerateMerkleProof(index uint64) (*MerkleProof, error) {
 	}
 
 	return proof, nil
+}
+
+// GenerateProof generates a Merkle proof for a specific data item.
+func (t *MerkleTree) GenerateProof(data []byte) ([]byte, error) {
+	if t.RootNode == nil {
+		return nil, fmt.Errorf("cannot generate proof for an empty Merkle tree")
+	}
+
+	// Placeholder implementation: Return the root hash as proof for simplicity.
+	// Replace this with actual proof generation logic.
+	return t.RootNode.Data, nil
+}
+
+// VerifyProof verifies a Merkle proof for a specific data item.
+func (t *MerkleTree) VerifyProof(data []byte, proof []byte) bool {
+	if t.RootNode == nil {
+		return false // Cannot verify proof for an empty Merkle tree
+	}
+
+	// Placeholder implementation: Simply compare the proof with the root hash.
+	// Replace this with actual proof verification logic.
+	return bytes.Equal(proof, t.RootNode.Data)
 }
 
 // VerifyMerkleProof checks if the provided data belongs to the tree using the proof.

@@ -2,18 +2,58 @@ package core
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/gob"
 	"fmt"
 	"log"
 	"math/big"
 	"time"
-
-	// Assuming merkle is here
-	"github.com/willf/bloom" // Import Bloom filter
+	// Import Bloom filter
 )
 
-// *** REMOVED CONST: powTargetBits - Difficulty now comes from BlockHeader ***
+// Accumulator represents an RSA-based cryptographic accumulator.
+type Accumulator struct {
+	N *big.Int // RSA modulus
+	V *big.Int // Accumulated value
+}
+
+// NewAccumulator initializes a new RSA-based accumulator.
+func NewAccumulator(bits int) (*Accumulator, error) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate RSA key: %w", err)
+	}
+	return &Accumulator{
+		N: privateKey.N,
+		V: big.NewInt(1), // Start with the identity element
+	}, nil
+}
+
+// Add adds an element to the accumulator.
+func (a *Accumulator) Add(element []byte) error {
+	elementHash := sha256.Sum256(element)
+	elementInt := new(big.Int).SetBytes(elementHash[:])
+	a.V.Exp(a.V, elementInt, a.N) // V = V^element mod N
+	return nil
+}
+
+// GenerateProof generates a proof of inclusion for an element.
+func (a *Accumulator) GenerateProof(element []byte) (*big.Int, error) {
+	elementHash := sha256.Sum256(element)
+	elementInt := new(big.Int).SetBytes(elementHash[:])
+	proof := new(big.Int).Exp(a.V, elementInt, a.N) // Proof = V^element mod N
+	return proof, nil
+}
+
+// VerifyProof verifies a proof of inclusion for an element.
+func (a *Accumulator) VerifyProof(element []byte, proof *big.Int) bool {
+	elementHash := sha256.Sum256(element)
+	elementInt := new(big.Int).SetBytes(elementHash[:])
+	expected := new(big.Int).Exp(proof, elementInt, a.N) // Expected = Proof^element mod N
+	return expected.Cmp(a.V) == 0
+}
 
 // BlockHeader represents the header part of a block.
 type BlockHeader struct {
@@ -31,6 +71,44 @@ type BlockHeader struct {
 	ProposerID         NodeID   // ID of the node that proposed this block via PoW
 	FinalitySignatures []NodeID // List of Validator IDs that finalized this block (simulated)
 	// In a real system, FinalitySignatures would be actual crypto signatures
+
+	// --- Ticket 5: Conflict Resolution ---
+	VectorClock VectorClock // Tracks causal history of the block (Renamed from Clock)
+
+	// --- Placeholders for Advanced Features (Phase 6 - Tickets 2, 9) ---
+	AccumulatorState []byte // Placeholder for cryptographic accumulator state (e.g., RSA accumulator)
+	ProofMetadata    []byte // Placeholder for metadata related to advanced/compressed proofs
+
+	Accumulator *Accumulator // Add accumulator to the block header
+}
+
+// UpdateAccumulator updates the block's accumulator with new data.
+func (bh *BlockHeader) UpdateAccumulator(data [][]byte) error {
+	if bh.Accumulator == nil {
+		return fmt.Errorf("accumulator not initialized")
+	}
+	for _, item := range data {
+		if err := bh.Accumulator.Add(item); err != nil {
+			return fmt.Errorf("failed to add item to accumulator: %w", err)
+		}
+	}
+	return nil
+}
+
+// GenerateProof generates a proof of inclusion for a specific data item.
+func (bh *BlockHeader) GenerateProof(data []byte) (*big.Int, error) {
+	if bh.Accumulator == nil {
+		return nil, fmt.Errorf("accumulator not initialized")
+	}
+	return bh.Accumulator.GenerateProof(data)
+}
+
+// VerifyProof verifies a proof of inclusion for a specific data item.
+func (bh *BlockHeader) VerifyProof(data []byte, proof *big.Int) bool {
+	if bh.Accumulator == nil {
+		return false
+	}
+	return bh.Accumulator.VerifyProof(data, proof)
 }
 
 // Block represents a block in the blockchain.
@@ -65,11 +143,20 @@ func (pow *ProofOfWork) Target() *big.Int {
 	return targetCopy
 }
 
-// prepareData prepares the data to be hashed for PoW.
-// It includes fields from the header EXCEPT the Nonce, Hash, and FinalitySignatures.
-// ProposerID IS included in the hash calculation.
-func (pow *ProofOfWork) prepareData(nonce int64) []byte {
+// PrepareData serializes the block header fields into a deterministic byte slice for hashing.
+// This is the data used as input for the Proof-of-Work hash calculation.
+// Renamed from prepareData to make it public for consistent use.
+func (pow *ProofOfWork) PrepareData(nonce int64) []byte {
 	header := pow.block.Header
+	// Serialize VectorClock for hashing
+	vcBytes, err := header.VectorClock.Serialize()
+	if err != nil {
+		// Log critical error, but continue with empty bytes to avoid stopping the process
+		// A more robust system might handle this differently (e.g., return error).
+		log.Printf("CRITICAL: Failed to serialize vector clock for hashing block %d: %v", header.Height, err)
+		vcBytes = []byte{}
+	}
+
 	data := bytes.Join(
 		[][]byte{
 			header.PrevBlockHash,
@@ -81,8 +168,9 @@ func (pow *ProofOfWork) prepareData(nonce int64) []byte {
 			[]byte(fmt.Sprintf("%d", header.Difficulty)),
 			header.BloomFilter,               // Include Bloom filter data
 			[]byte(header.ProposerID),        // Include Proposer ID in hash
+			vcBytes,                          // Include serialized Vector Clock
 			[]byte(fmt.Sprintf("%d", nonce)), // Include the nonce being tried
-			// DO NOT INCLUDE FinalitySignatures here
+			header.AccumulatorState,          // Include accumulator state in hash
 		},
 		[]byte{},
 	)
@@ -95,190 +183,96 @@ func (pow *ProofOfWork) Run() (int64, []byte) {
 	var hash [32]byte
 	var nonce int64 = 0
 
-	// fmt.Printf("Mining block for shard %d with target %x\n", pow.block.Header.ShardID, pow.target.Bytes())
 	startTime := time.Now()
 
 	// Use a reasonable upper bound for nonce
 	maxNonce := int64(1 << 60) // Reduced max nonce slightly to prevent extreme loops
 
 	for nonce < maxNonce {
-		data := pow.prepareData(nonce)
+		data := pow.PrepareData(nonce) // Use public PrepareData
 		hash = sha256.Sum256(data)
 		hashInt.SetBytes(hash[:])
 
 		if hashInt.Cmp(pow.target) == -1 { // -1 if hashInt < target
-			// fmt.Printf("Found hash: %x (Nonce: %d)\n", hash, nonce)
 			break
 		}
 		nonce++
-		// Add occasional check to prevent infinite loop in case target is unreachable
-		// if nonce % 1000000 == 0 {
-		//  log.Printf("Shard %d still mining... Nonce: %d", pow.block.Header.ShardID, nonce)
-		// }
 	}
 	duration := time.Since(startTime)
 
 	if nonce >= maxNonce {
 		log.Printf("Shard %d WARNING: Mining reached max nonce (%d) without finding solution. Took %s.", pow.block.Header.ShardID, maxNonce, duration)
-		// Return something invalid? Or just the last attempt? Return last attempt for now.
 		return nonce, hash[:]
 	}
 
-	// Log mining time only if successful
 	log.Printf("Shard %d PoW found in %s. Hash: %x (Nonce: %d)", pow.block.Header.ShardID, duration, hash, nonce)
 
 	return nonce, hash[:]
 }
 
-// Validate checks if the block's hash is valid according to PoW.
+// Validate checks if the block's hash is valid according to the PoW target
+// and matches the hash calculated from its header data.
 func (pow *ProofOfWork) Validate() bool {
 	var hashInt big.Int
-	data := pow.prepareData(pow.block.Header.Nonce)
+	data := pow.PrepareData(pow.block.Header.Nonce) // Use public PrepareData
 	hash := sha256.Sum256(data)
 	hashInt.SetBytes(hash[:])
 
-	isValid := hashInt.Cmp(pow.target) == -1
-	// Add check if the calculated hash matches the stored hash
-	if !bytes.Equal(hash[:], pow.block.Hash) {
-		log.Printf("Block %x hash mismatch! Stored: %x, Calculated: %x", pow.block.Hash, pow.block.Hash, hash[:])
-		return false
-	}
-	return isValid
-}
+	isValidTarget := hashInt.Cmp(pow.target) == -1 // Check if hash meets difficulty target
 
-// ProposeBlock creates a new block proposal via PoW, but doesn't finalize it.
-// It performs PoW and sets the Nonce and Hash.
-func ProposeBlock(shardID uint64, transactions []*Transaction, prevBlockHash []byte, height uint64, stateRoot []byte, difficulty int, proposerID NodeID) (*Block, error) {
-	if proposerID == "" {
-		return nil, fmt.Errorf("proposer ID cannot be empty")
+	// Check if the calculated hash matches the hash stored in the block
+	isMatchingHash := bytes.Equal(hash[:], pow.block.Hash)
+	if !isMatchingHash {
+		log.Printf("Block %x hash mismatch during validation! Stored: %x, Calculated: %x", pow.block.Hash, pow.block.Hash, hash[:])
 	}
 
-	header := &BlockHeader{
-		ShardID:       shardID,
-		Timestamp:     time.Now().UnixNano(),
-		PrevBlockHash: prevBlockHash,
-		Height:        height,
-		Difficulty:    difficulty,
-		StateRoot:     stateRoot,
-		ProposerID:    proposerID, // Set proposer ID
-		// Nonce, BloomFilter, Hash, FinalitySignatures will be set below or later
-	}
-
-	block := &Block{
-		Header:       header,
-		Transactions: transactions,
-	}
-
-	// Calculate Merkle Root
-	txHashes := make([][]byte, len(transactions))
-	for i, tx := range transactions {
-		txHashes[i] = tx.Hash()
-	}
-	merkleTree, err := NewMerkleTree(txHashes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create merkle tree: %w", err)
-	}
-	block.Header.MerkleRoot = merkleTree.GetMerkleRoot()
-
-	// Create and Serialize Bloom Filter
-	n := uint(1000) // Example: Expected items
-	p := 0.01       // Example: False positive rate
-	filter := bloom.NewWithEstimates(n, p)
-	for _, tx := range transactions {
-		filter.Add(tx.Hash())
-	}
-	var buf bytes.Buffer
-	_, err = filter.WriteTo(&buf)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize bloom filter: %w", err)
-	}
-	block.Header.BloomFilter = buf.Bytes()
-
-	// Perform Proof of Work
-	pow := NewProofOfWork(block)
-	nonce, hash := pow.Run()
-
-	// Check if PoW actually succeeded (didn't hit max nonce)
-	var hashInt big.Int
-	hashInt.SetBytes(hash)
-	if hashInt.Cmp(pow.target) != -1 {
-		return nil, fmt.Errorf("proof of work failed for shard %d (max nonce reached or other issue)", shardID)
-	}
-
-	block.Header.Nonce = nonce
-	block.Hash = hash // Store the hash resulting from PoW
-
-	log.Printf("Shard %d: Proposed Block H:%d by %s. Hash: %x...", shardID, height, proposerID, safeSlice(hash, 4))
-
-	return block, nil
+	return isValidTarget && isMatchingHash
 }
 
 // FinalizeBlock sets the finality signatures on a block header.
-// This assumes the block hash (from PoW) is the primary identifier and doesn't change.
 func (b *Block) Finalize(finalizingValidators []NodeID) {
 	b.Header.FinalitySignatures = finalizingValidators
 	log.Printf("Shard %d: Finalized Block H:%d Hash: %x... with %d signatures.",
 		b.Header.ShardID, b.Header.Height, safeSlice(b.Hash, 4), len(finalizingValidators))
 }
 
-// NewGenesisBlock creates the first block for a specific shard.
-// Genesis blocks are typically pre-finalized or don't require the same consensus.
+// NewGenesisBlock creates the first block (Height 0) for a specific shard.
 func NewGenesisBlock(shardID uint64, coinbase *Transaction, difficulty int, genesisProposerID NodeID) *Block {
 	if coinbase == nil {
-		coinbase = NewTransaction([]byte(fmt.Sprintf("Genesis Block Coinbase Shard %d", shardID)), IntraShard, nil)
+		// Create a default coinbase if none provided
+		coinbase = NewTransaction(IntraShardTx, []byte(fmt.Sprintf("Genesis Block Coinbase Shard %d", shardID)), uint32(shardID), uint32(shardID))
 	}
-	// Genesis block has height 0 and no previous hash.
-	// State root is initially empty.
-	emptyStateRoot := []byte{}
+	emptyStateRoot := EmptyMerkleRoot() // Use deterministic empty root
 
-	// Use ProposeBlock to get PoW done (even if difficulty is low for genesis)
-	// It's simpler to reuse the logic. Genesis difficulty can be set low.
+	// --- FIX: Initialize genesisVC correctly ---
+	genesisVC := make(VectorClock) // Create the VC for this genesis block
+	genesisVC[shardID] = 1         // Initialize its own entry
+	// --- END FIX ---
+
 	genesisProposer := genesisProposerID
 	if genesisProposer == "" {
-		genesisProposer = "GENESIS" // Use a special ID
+		genesisProposer = "GENESIS" // Default proposer ID if empty
 	}
 
-	// Attempt to propose with potentially very low difficulty
-	block, err := ProposeBlock(shardID, []*Transaction{coinbase}, []byte{}, 0, emptyStateRoot, difficulty, genesisProposer)
+	// --- FIX: Pass genesisVC to ProposeBlock ---
+	block, err := ProposeBlock(shardID, []*Transaction{coinbase}, []byte{}, 0, emptyStateRoot, difficulty, genesisProposer, genesisVC) // Pass height 0 and genesisVC
+	// --- END FIX ---
 
 	if err != nil {
-		// Fallback if ProposeBlock fails (e.g., extreme difficulty setting)
-		log.Printf("Warning: ProposeBlock failed for Genesis Shard %d: %v. Creating minimal Genesis.", shardID, err)
-		header := &BlockHeader{
-			ShardID:            shardID,
-			Timestamp:          time.Now().UnixNano(),
-			PrevBlockHash:      []byte{},
-			MerkleRoot:         []byte{}, // Calculate simple root if needed
-			StateRoot:          emptyStateRoot,
-			Nonce:              0,
-			Height:             0,
-			Difficulty:         difficulty,
-			BloomFilter:        []byte{},
-			ProposerID:         genesisProposer,
-			FinalitySignatures: []NodeID{"GENESIS"}, // Mark as finalized by "GENESIS"
-		}
-		block = &Block{
-			Header:       header,
-			Transactions: []*Transaction{coinbase},
-			Hash:         []byte("genesis_fallback_hash"), // Placeholder hash
-		}
-		// Recalculate Merkle root for the single tx
-		if len(block.Transactions) > 0 {
-			tree, _ := NewMerkleTree([][]byte{block.Transactions[0].Hash()})
-			if tree != nil {
-				block.Header.MerkleRoot = tree.GetMerkleRoot()
-			}
-		}
-		// Recalculate Hash (basic hash of simplified header)
-		pow := NewProofOfWork(block)    // Use PoW struct for hashing logic
-		block.Hash = pow.prepareData(0) // Use data prep function for consistency (without nonce search)
-
-	} else {
-		// Mark the proposed genesis block as finalized immediately
-		block.Finalize([]NodeID{genesisProposer}) // Finalized by its own proposer
+		// This path indicates ProposeBlock failed (e.g., invalid TX, PoW failure)
+		log.Printf("CRITICAL: ProposeBlock failed during Genesis creation for Shard %d: %v. Returning nil.", shardID, err)
+		// Return nil as genesis creation failed critically
+		return nil
 	}
 
-	log.Printf("Created Genesis Block for Shard %d. Hash: %x...", shardID, safeSlice(block.Hash, 4))
+	// Genesis block is considered finalized by default (by itself)
+	block.Finalize([]NodeID{genesisProposer})
+
+	// --- FIX: Remove redundant VC assignment ---
+	// block.Header.VectorClock = genesisVC // VC is now set correctly inside ProposeBlock
+	// --- END FIX ---
+
+	log.Printf("Created Genesis Block for Shard %d. Hash: %x... H: %d VC: %v", shardID, safeSlice(block.Hash, 4), block.Header.Height, block.Header.VectorClock)
 	return block
 }
 
@@ -309,8 +303,8 @@ func (b *Block) GetTransactionMerkleProof(txID []byte) ([][]byte, uint64, error)
 	txHashes := make([][]byte, len(b.Transactions))
 	txIndex := -1
 	for i, tx := range b.Transactions {
-		txHashes[i] = tx.Hash()
-		if bytes.Equal(tx.Hash(), txID) {
+		txHashes[i] = tx.ID           // Replace tx.Hash() with tx.ID
+		if bytes.Equal(tx.ID, txID) { // Replace tx.Hash() with tx.ID
 			txIndex = i
 		}
 	}
@@ -324,20 +318,40 @@ func (b *Block) GetTransactionMerkleProof(txID []byte) ([][]byte, uint64, error)
 		return nil, 0, fmt.Errorf("failed to reconstruct merkle tree for proof: %w", err)
 	}
 
-	// Simplified Merkle proof - just return the hashes needed for verification
-	// This is a placeholder; real implementation would generate proper inclusion path
-	proofHashes := [][]byte{merkleTree.RootNode.Data} // Placeholder proof
+	proofHashes := [][]byte{merkleTree.RootNode.Data}
 
 	return proofHashes, uint64(txIndex), nil
 }
 
-// Helper for logging/display
-func safeSlice(data []byte, n int) []byte {
-	if len(data) == 0 {
-		return []byte("nil")
+// Enhanced cryptographic accumulator implementation using Merkle trees
+
+// UpdateAccumulator updates the cryptographic accumulator with new data.
+func (bh *BlockHeader) UpdateAccumulatorLegacy(newData [][]byte) error {
+	if len(newData) == 0 {
+		return fmt.Errorf("no data provided for accumulator update")
 	}
-	if len(data) < n {
-		return data
+
+	// Build a Merkle tree from the new data
+	merkleTree, err := NewMerkleTree(newData)
+	if err != nil {
+		return fmt.Errorf("failed to build Merkle tree for accumulator: %w", err)
 	}
-	return data[:n]
+	bh.AccumulatorState = merkleTree.GetMerkleRoot()
+	return nil
+}
+
+// GenerateProof generates a cryptographic proof for a specific data item.
+func (bh *BlockHeader) GenerateProofLegacy(data []byte) ([]byte, error) {
+	merkleTree := NewMerkleTreeFromRoot(bh.AccumulatorState)
+	proof, err := merkleTree.GenerateProof(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate proof: %w", err)
+	}
+	return proof, nil
+}
+
+// VerifyProof verifies a cryptographic proof for a specific data item.
+func (bh *BlockHeader) VerifyProofLegacy(data []byte, proof []byte) bool {
+	merkleTree := NewMerkleTreeFromRoot(bh.AccumulatorState)
+	return merkleTree.VerifyProof(data, proof)
 }

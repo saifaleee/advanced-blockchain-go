@@ -116,58 +116,53 @@ func (s *Shard) ApplyStateChanges(transactions []*Transaction) ([]byte, error) {
 	originalSize := s.StateDB.Size()
 	txsApplied := 0
 
+	conflictResolver := NewConflictResolver() // Use the advanced conflict resolver
+
 	// Apply transactions to state (example logic, adapt based on TX meaning)
 	for _, tx := range transactions {
-		// Try to parse key-value pair from data if it contains a separator
+		var key []byte
+		var value []byte
+		var keyStr string // Use string for DB operations
+
 		if bytes.Contains(tx.Data, []byte(":")) {
 			parts := bytes.SplitN(tx.Data, []byte(":"), 2)
 			if len(parts) == 2 {
-				key := parts[0]
-				value := parts[1]
-
-				err := s.StateDB.Put(key, value)
-				if err != nil {
-					log.Printf("Shard %d: Error applying state for TX %x: %v\n", s.ID, tx.ID, err)
-					return nil, fmt.Errorf("failed to apply state for tx %x: %w", tx.ID, err)
-				}
-				txsApplied++
-				s.Metrics.TxCount.Add(1)
-				continue
+				key = parts[0]
+				value = parts[1]
 			}
 		}
-
-		// Fall back to using TX hash as key if no structured data
-		key := tx.Hash()
-		value := tx.Data // Default value
-
-		// In a real system, logic depends heavily on transaction content:
-		// - Transfers: Debit sender, credit receiver (check balances)
-		// - Contract calls: Execute VM, update contract storage
-		// - CrossShardApply: Use data from receipt (e.g., credit receiver)
-
-		if tx.Type == CrossShardTxFinalize {
-			log.Printf("Shard %d: Applying state for cross-shard TX %x (from source receipt)\n", s.ID, tx.ID)
-			// Example: Use specific key if carried in TX data, otherwise use TX hash
-			err := s.StateDB.Put(key, value)
-			if err != nil {
-				log.Printf("Shard %d: Error applying state for CrossShardTxFinalize TX %x: %v\n", s.ID, tx.ID, err)
-				// Consider revert strategy or error handling
-				return nil, fmt.Errorf("failed to apply state for CrossShardTxFinalize tx %x: %w", tx.ID, err)
-			}
-			txsApplied++
-		} else if tx.Type == IntraShard || tx.Type == CrossShardTxInit {
-			// Apply standard intra-shard or the initiation part of cross-shard
-			// log.Printf("Shard %d: Applying state for TX %x (Type: %d)\n", s.ID, tx.ID, tx.Type)
-			err := s.StateDB.Put(key, value) // Example state change
-			if err != nil {
-				log.Printf("Shard %d: Error applying state for TX %x: %v\n", s.ID, tx.ID, err)
-				return nil, fmt.Errorf("failed to apply state for tx %x: %w", tx.ID, err)
-			}
-			txsApplied++
-		} else {
-			log.Printf("Shard %d: Skipping state application for unknown TX type %d (TX ID: %x)", s.ID, tx.Type, tx.ID)
+		if key == nil {
+			key = tx.ID // Replace tx.Hash() with tx.ID
+			value = tx.Data
 		}
-		s.Metrics.TxCount.Add(1) // Increment processed TX count
+		keyStr = string(key) // Convert key to string for DB
+
+		// --- Advanced Conflict Detection & Resolution ---
+		existingValue, err := s.StateDB.Get(keyStr)
+		if err == nil && existingValue != nil {
+			localVersion := StateVersion{
+				Key:         keyStr, // Use string key
+				Value:       existingValue,
+				VectorClock: make(VectorClock), // Corrected: Use make() for map[uint64]uint64
+				SourceNode:  "local",
+			}
+			remoteVersion := StateVersion{
+				Key:         keyStr, // Use string key
+				Value:       value,
+				VectorClock: make(VectorClock), // Corrected: Use make() for map[uint64]uint64
+				SourceNode:  "tx",
+			}
+			resolved := conflictResolver.HandlePotentialConflict(localVersion, remoteVersion, tx.ID) // Replace tx.Hash() with tx.ID
+			value = resolved.Value.([]byte)
+		}
+		// else: no existing value, just write
+		err = s.StateDB.Put(keyStr, value)
+		if err != nil {
+			log.Printf("Shard %d: Error applying state for TX %x: %v\n", s.ID, tx.ID, err)
+			return nil, fmt.Errorf("failed to apply state for tx %x: %w", tx.ID, err)
+		}
+		txsApplied++
+		s.Metrics.TxCount.Add(1)
 	}
 
 	// Update state size metric (based on number of keys for InMemoryStateDB)
@@ -291,7 +286,7 @@ func (sm *ShardManager) GetAllShardIDs() []uint64 {
 	idsCopy := make([]uint64, len(sm.shardIDs))
 	copy(idsCopy, sm.shardIDs)
 	// Should already be sorted, but ensure it just in case
-	sort.Slice(idsCopy, func(i, j int) bool { return idsCopy[i] < idsCopy[j] })
+	sort.Slice(idsCopy, func(i, j int) bool { return idsCopy[i] < sm.shardIDs[j] })
 	return idsCopy
 }
 
@@ -627,7 +622,7 @@ func (sm *ShardManager) triggerMergeUnsafe(shardAID, shardBID uint64) error {
 	for _, key := range keysToMigrate {
 		value, getErr := shardB.StateDB.Get(key)
 		if getErr != nil {
-			log.Printf("Merge Migration Error: Failed to get value for key %x from source shard %d: %v", key, shardBID, getErr)
+			log.Printf("Merge Migration Error: Failed to get value for key %s from source shard %d: %v", key, shardBID, getErr)
 			failedMigrationCount++
 			continue
 		}
@@ -635,7 +630,7 @@ func (sm *ShardManager) triggerMergeUnsafe(shardAID, shardBID uint64) error {
 		// Check for conflicts? Overwrite existing keys in A? For simplicity, overwrite.
 		putErr := shardA.StateDB.Put(key, value)
 		if putErr != nil {
-			log.Printf("Merge Migration Error: Failed to put key %x into target shard %d: %v", key, shardAID, putErr)
+			log.Printf("Merge Migration Error: Failed to put key %s into target shard %d: %v", key, shardAID, putErr)
 			failedMigrationCount++
 		} else {
 			migratedCount++
@@ -650,12 +645,10 @@ func (sm *ShardManager) triggerMergeUnsafe(shardAID, shardBID uint64) error {
 	}
 
 	// Clear state DB of the merged shard AFTER successful migration (or based on error handling policy)
-	// if failedMigrationCount == 0 { // Only clear if migration seemed ok? Or always try?
 	clearErr := shardB.StateDB.Clear()
 	if clearErr != nil {
 		log.Printf("Merge Warning: Failed to clear state DB for merged shard %d: %v", shardBID, clearErr)
 	}
-	// }
 
 	// Update metrics for the target shard
 	shardA.Metrics.StateSize.Store(int64(shardA.StateDB.Size()))
